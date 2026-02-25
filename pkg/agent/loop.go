@@ -358,7 +358,7 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			return al.taskPipeline.BuildStatusReply(msg.Channel, msg.ChatID, msg.SenderID), nil
 		}
 
-		summaryCtx, summaryCancel := context.WithTimeout(ctx, 3*time.Second)
+		summaryCtx, summaryCancel := context.WithTimeout(ctx, 12*time.Second)
 		taskSummary := al.generateTaskSummary(summaryCtx, msg.Content)
 		summaryCancel()
 		if taskSummary == "" {

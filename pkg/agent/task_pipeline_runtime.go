@@ -17,6 +17,8 @@ const plannerTaskChannel = "planner_task"
 
 const plannerEmptySummaryText = "Planner completed with no textual output."
 
+const taskBriefMaxLength = 48
+
 var sensitiveTaskSummaryPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)https?://`),
 	regexp.MustCompile(`(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b`),
@@ -287,17 +289,17 @@ func (al *AgentLoop) generateTaskSummary(ctx context.Context, request string) st
 	}
 
 	resp, err := planner.Provider.Chat(ctx, []providers.Message{
-		{Role: "system", Content: "You generate concise task briefs for tracking. Output must be English, plain text, and at most 20 characters. Use only letters, numbers, spaces, and common punctuation. Never include secrets, tokens, URLs, emails, IDs, or long numbers."},
-		{Role: "user", Content: "Write a task brief for this request. Requirement: English only, <=20 characters, no markdown, no quotes, generic and descriptive:\n" + request},
+		{Role: "system", Content: "You generate concise task briefs for tracking. Output must be English, plain text, and at most 48 characters. Use only letters, numbers, spaces, and common punctuation. Never include secrets, tokens, URLs, emails, IDs, or long numbers."},
+		{Role: "user", Content: "Write a task brief for this request. Requirement: English only, <=48 characters, no markdown, no quotes, generic and descriptive:\n" + request},
 	}, nil, planner.Model, map[string]any{
-		"max_tokens":  40,
+		"max_tokens":  64,
 		"temperature": 0,
 	})
 	if err != nil || resp == nil {
 		return fallback
 	}
 
-	label := normalizeTaskSummary(resp.Content)
+	label := sanitizeTaskSummary(resp.Content)
 	if !isSafeTaskBrief(label) {
 		return fallback
 	}
@@ -308,15 +310,48 @@ func (al *AgentLoop) generateTaskSummary(ctx context.Context, request string) st
 // It takes no parameters and intentionally avoids user content to reduce leakage risk.
 // It returns a non-empty generic label string.
 func fallbackTaskSummary() string {
-	return "task"
+	return "user request"
+}
+
+// sanitizeTaskSummary normalizes and cleans model-generated task brief text.
+// The summary parameter is raw model output and may include wrappers or unsupported punctuation.
+// It returns a cleaned single-line brief suitable for safety validation.
+func sanitizeTaskSummary(summary string) string {
+	clean := strings.TrimSpace(summary)
+	clean = strings.Trim(clean, "`\"'“”‘’")
+	clean = strings.Join(strings.Fields(clean), " ")
+	if clean == "" {
+		return ""
+	}
+
+	var sb strings.Builder
+	for _, r := range clean {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			sb.WriteRune(r)
+			continue
+		}
+		switch r {
+		case ' ', '/', '+', '&', ',', '_', '(', ')', '.', '-':
+			sb.WriteRune(r)
+		default:
+			sb.WriteRune(' ')
+		}
+	}
+
+	return normalizeTaskSummary(sb.String())
 }
 
 // isSafeTaskBrief validates generated task brief for display safety and readability.
 // The summary parameter is normalized one-line text from model output.
 // It returns true when the brief is English-like, short, and free of sensitive patterns.
 func isSafeTaskBrief(summary string) bool {
-	summary = normalizeTaskSummary(summary)
-	if summary == "" || len(summary) > 20 {
+	raw := normalizeTaskSummary(summary)
+	if raw != "" && containsSensitiveTaskSummaryText(raw) {
+		return false
+	}
+
+	summary = sanitizeTaskSummary(summary)
+	if summary == "" || len(summary) > taskBriefMaxLength {
 		return false
 	}
 	if !taskBriefAllowedPattern.MatchString(summary) {
@@ -604,7 +639,7 @@ func (al *AgentLoop) maybeHandleTaskControlCommand(ctx context.Context, msg bus.
 
 	taskSummary := task.Summary
 	if strings.TrimSpace(taskSummary) == "" || taskSummary == fallbackTaskSummary() {
-		summaryCtx, summaryCancel := context.WithTimeout(ctx, 3*time.Second)
+		summaryCtx, summaryCancel := context.WithTimeout(ctx, 12*time.Second)
 		taskSummary = al.generateTaskSummary(summaryCtx, task.Request)
 		summaryCancel()
 		if taskSummary == "" {

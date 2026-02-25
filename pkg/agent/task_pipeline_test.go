@@ -233,3 +233,23 @@ func TestTaskPipeline_NextSequenceForDateLocked(t *testing.T) {
 	require.Equal(t, 1, tp.nextSequenceForDateLocked("2026-02-26"))
 	require.Equal(t, 2, tp.nextSequenceForDateLocked("2026-02-26"))
 }
+
+// TestSanitizeTaskSummary verifies model output is normalized for task label display.
+// It covers markdown wrappers, unsupported punctuation, and whitespace normalization.
+// It returns no value and fails test on unexpected normalized content.
+func TestSanitizeTaskSummary(t *testing.T) {
+	clean := sanitizeTaskSummary("  `Investigate: telegram timeout #123`  ")
+	require.Equal(t, "Investigate telegram timeout 123", clean)
+
+	clean = sanitizeTaskSummary("\nfix   queue\tdeadlock\n")
+	require.Equal(t, "fix queue deadlock", clean)
+}
+
+// TestIsSafeTaskBrief verifies safety validator accepts clean labels and rejects sensitive/invalid content.
+// It checks URL and long-number patterns are blocked while concise summaries pass.
+// It returns no value and fails test on incorrect validation result.
+func TestIsSafeTaskBrief(t *testing.T) {
+	require.True(t, isSafeTaskBrief("Investigate queue deadlock"))
+	require.False(t, isSafeTaskBrief("https://example.com/reset"))
+	require.False(t, isSafeTaskBrief("ticket 123456789"))
+}

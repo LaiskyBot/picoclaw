@@ -652,8 +652,8 @@ func normalizeTaskSummary(summary string) string {
 	if normalized == "" {
 		return ""
 	}
-	if len(normalized) > 20 {
-		return normalized[:20]
+	if len(normalized) > taskBriefMaxLength {
+		return normalized[:taskBriefMaxLength]
 	}
 	return normalized
 }
