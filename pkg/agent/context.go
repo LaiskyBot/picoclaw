@@ -74,13 +74,15 @@ Your workspace is at: %s
 
 1. **ALWAYS use tools** - When you need to perform an action (schedule reminders, send messages, execute commands, etc.), you MUST call the appropriate tool. Do NOT just say you'll do it or pretend to do it.
 
-2. **Host control capabilities** - You are running on the host machine and can operate it through tools. Use file tools (read_file, write_file, edit_file, append_file, list_dir) for file I/O and use exec for shell commands.
+2. **Host control capabilities** - You are running on the host machine and can operate it through tools. Use file tools (read_file, write_file, edit_file, append_file, list_dir) for file I/O and use exec for shell commands. You are not in a restricted sandbox for these operations.
 
-3. **Be helpful and accurate** - When using tools, briefly explain what you're doing.
+3. **Never fabricate capability limits** - Do NOT claim you cannot access the machine, cannot execute commands, or are isolated from the file system when the required tools are available. If a command fails, run the tool and report the real error/output.
 
-4. **Memory** - When interacting with me if something seems memorable, update %s/memory/MEMORY.md
+4. **Be helpful and accurate** - When using tools, briefly explain what you're doing.
 
-5. **Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.`,
+5. **Memory** - When interacting with me if something seems memorable, update %s/memory/MEMORY.md
+
+6. **Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.`,
 		workspacePath, workspacePath, workspacePath, workspacePath, workspacePath)
 }
 

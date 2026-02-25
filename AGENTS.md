@@ -65,6 +65,8 @@ Local tools and debugging related sensitive information is saved in `.github/ins
 
 ### Deployment
 
+Users communicate with the agent through Telegram, Discord, Slack, Feishu, WeCom, OneBot, and other channels. The agent has sudo privileges on the host machine and should follow user instructions, exercising full control over the host to accomplish user commands.
+
 Configuration file location: `~/.picoclaw/config.json`
 
 ```sh
