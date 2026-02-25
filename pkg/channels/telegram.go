@@ -173,8 +173,18 @@ func (c *TelegramChannel) Send(ctx context.Context, msg bus.OutboundMessage) err
 		editMsg.ParseMode = telego.ModeHTML
 
 		if _, err = c.bot.EditMessageText(ctx, editMsg); err == nil {
+			logger.InfoCF("telegram", "Edited thinking placeholder with final response", map[string]any{
+				"chat_id":      msg.ChatID,
+				"message_id":   pID.(int),
+				"content_chars": len(msg.Content),
+			})
 			return nil
 		}
+		logger.WarnCF("telegram", "Failed to edit placeholder, will send a new message", map[string]any{
+			"chat_id":    msg.ChatID,
+			"message_id": pID.(int),
+			"error":      err.Error(),
+		})
 		// Fallback to new message if edit fails
 	}
 
@@ -189,6 +199,11 @@ func (c *TelegramChannel) Send(ctx context.Context, msg bus.OutboundMessage) err
 		_, err = c.bot.SendMessage(ctx, tgMsg)
 		return err
 	}
+
+	logger.InfoCF("telegram", "Sent final response as a new message", map[string]any{
+		"chat_id":       msg.ChatID,
+		"content_chars": len(msg.Content),
+	})
 
 	return nil
 }
@@ -352,6 +367,17 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Mes
 	if err == nil {
 		pID := pMsg.MessageID
 		c.placeholders.Store(chatIDStr, pID)
+		logger.InfoCF("telegram", "Sent thinking placeholder", map[string]any{
+			"chat_id":    chatIDStr,
+			"message_id": pID,
+			"sender_id":  senderID,
+		})
+	} else {
+		logger.WarnCF("telegram", "Failed to send thinking placeholder", map[string]any{
+			"chat_id":   chatIDStr,
+			"sender_id": senderID,
+			"error":     err.Error(),
+		})
 	}
 
 	peerKind := "direct"
@@ -371,7 +397,13 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Mes
 		"peer_id":    peerID,
 	}
 
-	c.HandleMessage(fmt.Sprintf("%d", user.ID), fmt.Sprintf("%d", chatID), content, mediaPaths, metadata)
+	c.HandleMessage(senderID, fmt.Sprintf("%d", chatID), content, mediaPaths, metadata)
+	logger.InfoCF("telegram", "Published inbound message to bus", map[string]any{
+		"chat_id":     chatIDStr,
+		"sender_id":   senderID,
+		"content_chars": len(content),
+		"media_count": len(mediaPaths),
+	})
 	return nil
 }
 

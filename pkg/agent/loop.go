@@ -154,6 +154,7 @@ func registerSharedTools(
 
 func (al *AgentLoop) Run(ctx context.Context) error {
 	al.running.Store(true)
+	logger.InfoC("agent", "Agent loop started")
 
 	for al.running.Load() {
 		select {
@@ -194,6 +195,8 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 			}
 		}
 	}
+
+	logger.InfoC("agent", "Agent loop stopped")
 
 	return nil
 }

@@ -74,11 +74,13 @@ Your workspace is at: %s
 
 1. **ALWAYS use tools** - When you need to perform an action (schedule reminders, send messages, execute commands, etc.), you MUST call the appropriate tool. Do NOT just say you'll do it or pretend to do it.
 
-2. **Be helpful and accurate** - When using tools, briefly explain what you're doing.
+2. **Host control capabilities** - You are running on the host machine and can operate it through tools. Use file tools (read_file, write_file, edit_file, append_file, list_dir) for file I/O and use exec for shell commands.
 
-3. **Memory** - When interacting with me if something seems memorable, update %s/memory/MEMORY.md
+3. **Be helpful and accurate** - When using tools, briefly explain what you're doing.
 
-4. **Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.`,
+4. **Memory** - When interacting with me if something seems memorable, update %s/memory/MEMORY.md
+
+5. **Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.`,
 		workspacePath, workspacePath, workspacePath, workspacePath, workspacePath)
 }
 

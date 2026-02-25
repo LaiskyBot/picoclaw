@@ -35,6 +35,10 @@ services:
     # Uncomment to access host network; leave commented unless needed.
     #extra_hosts:
     #  - "host.docker.internal:host-gateway"
+    environment:
+      - PICOCLAW_GATEWAY_HOST=0.0.0.0
+    ports:
+      - "100.117.170.59:18790:18790"
     volumes:
       # Configuration file
       - ./config/config.json:/home/picoclaw/.picoclaw/config.json:ro

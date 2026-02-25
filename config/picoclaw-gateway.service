@@ -1,0 +1,19 @@
+[Unit]
+Description=PicoClaw Gateway Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+Group=bot
+WorkingDirectory=/home/bot/.picoclaw
+Environment=HOME=/home/bot
+ExecStart=/home/bot/.local/bin/picoclaw gateway
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

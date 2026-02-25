@@ -3,6 +3,8 @@ package bus
 import (
 	"context"
 	"sync"
+
+	"github.com/sipeed/picoclaw/pkg/logger"
 )
 
 type MessageBus struct {
@@ -28,11 +30,23 @@ func (mb *MessageBus) PublishInbound(msg InboundMessage) {
 		return
 	}
 	mb.inbound <- msg
+	logger.InfoCF("bus", "Published inbound message", map[string]any{
+		"channel":      msg.Channel,
+		"chat_id":      msg.ChatID,
+		"sender_id":    msg.SenderID,
+		"content_chars": len(msg.Content),
+	})
 }
 
 func (mb *MessageBus) ConsumeInbound(ctx context.Context) (InboundMessage, bool) {
 	select {
 	case msg := <-mb.inbound:
+		logger.InfoCF("bus", "Consumed inbound message", map[string]any{
+			"channel":      msg.Channel,
+			"chat_id":      msg.ChatID,
+			"sender_id":    msg.SenderID,
+			"content_chars": len(msg.Content),
+		})
 		return msg, true
 	case <-ctx.Done():
 		return InboundMessage{}, false
