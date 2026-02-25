@@ -30,16 +30,16 @@ import (
 )
 
 type AgentLoop struct {
-	bus            *bus.MessageBus
-	cfg            *config.Config
-	registry       *AgentRegistry
-	state          *state.Manager
-	taskPipeline   *TaskPipeline
+	bus             *bus.MessageBus
+	cfg             *config.Config
+	registry        *AgentRegistry
+	state           *state.Manager
+	taskPipeline    *TaskPipeline
 	taskMaxParallel int
-	running        atomic.Bool
-	summarizing    sync.Map
-	fallback       *providers.FallbackChain
-	channelManager *channels.Manager
+	running         atomic.Bool
+	summarizing     sync.Map
+	fallback        *providers.FallbackChain
+	channelManager  *channels.Manager
 }
 
 // processOptions configures how a message is processed
@@ -145,6 +145,7 @@ func registerSharedTools(
 		)
 		agent.Tools.Register(tools.NewFindSkillsTool(registryMgr, searchCache))
 		agent.Tools.Register(tools.NewInstallSkillTool(registryMgr, agent.Workspace))
+		agent.Tools.Register(tools.NewRemoteMCPTool(agent.Workspace))
 
 		// Spawn tool with allowlist checker
 		subagentManager := tools.NewSubagentManager(provider, agent.Model, agent.Workspace, msgBus)
@@ -344,11 +345,14 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			executionMode = TaskExecutionModeWait
 		}
 
+		taskSummary := al.generateTaskSummary(ctx, msg.Content)
+
 		task, err := al.taskPipeline.EnqueueTaskWithScheduling(
 			msg.Channel,
 			msg.ChatID,
 			msg.SenderID,
 			msg.Content,
+			taskSummary,
 			executionMode,
 			scheduleDecision.DependsOn,
 			dispatchNow,
@@ -368,8 +372,9 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 				question = "Should I run this task in parallel or wait for currently running tasks to finish?"
 			}
 			return fmt.Sprintf(
-				"Task %s is queued in waiting mode. %s Reply with 'parallel %s' to run it now.",
+				"Task %s [%s] is queued in waiting mode. %s Reply with 'parallel %s' to run it now.",
 				task.ID,
+				taskSummary,
 				question,
 				task.ID,
 			), nil
@@ -377,19 +382,21 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 
 		if !dispatchNow {
 			if len(scheduleDecision.DependsOn) == 0 {
-				return fmt.Sprintf("Task %s accepted and queued to wait for existing tasks.", task.ID), nil
+				return fmt.Sprintf("Task %s [%s] accepted and queued to wait for existing tasks.", task.ID, taskSummary), nil
 			}
 			return fmt.Sprintf(
-				"Task %s accepted and waiting for %s. Reply with 'parallel %s' if you want to force parallel execution.",
+				"Task %s [%s] accepted and waiting for %s. Reply with 'parallel %s' if you want to force parallel execution.",
 				task.ID,
+				taskSummary,
 				strings.Join(scheduleDecision.DependsOn, ", "),
 				task.ID,
 			), nil
 		}
 
 		return fmt.Sprintf(
-			"Task %s accepted. I have delegated it to the planner and will keep you updated. Send /status anytime for progress.",
+			"Task %s [%s] accepted. I have delegated it to the planner and will keep you updated. Send /status anytime for progress.",
 			task.ID,
+			taskSummary,
 		), nil
 	}
 

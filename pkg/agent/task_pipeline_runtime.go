@@ -106,7 +106,7 @@ func (al *AgentLoop) executePlannerTask(parentCtx context.Context, task *Pipelin
 	al.bus.PublishOutbound(bus.OutboundMessage{
 		Channel: task.Channel,
 		ChatID:  task.ChatID,
-		Content: fmt.Sprintf("Task %s is now running with planner '%s'.", task.ID, planner.ID),
+		Content: fmt.Sprintf("Task %s is now running with planner '%s'.", taskLabel(task), planner.ID),
 	})
 
 	runCtx, cancel := context.WithTimeout(parentCtx, 40*time.Minute)
@@ -195,10 +195,11 @@ func formatTaskFinalReport(task *PipelineTask, finalStatus, summary string) stri
 	}
 
 	return fmt.Sprintf(
-		"Task %s finished.\n- status: %s\n- planner: %s\n- started_at_utc: %s\n- finished_at_utc: %s\n- duration: %s\n- worker_updates: %d\n- summary: %s",
+		"Task %s finished.\n- status: %s\n- planner: %s\n- task_summary: %s\n- started_at_utc: %s\n- finished_at_utc: %s\n- duration: %s\n- worker_updates: %d\n- summary: %s",
 		task.ID,
 		finalStatus,
 		valueOrNA(task.PlannerAgent),
+		valueOrNA(task.Summary),
 		started,
 		finished,
 		duration,
@@ -260,9 +261,61 @@ func (al *AgentLoop) maybePromoteQueuedTasks() {
 		al.bus.PublishOutbound(bus.OutboundMessage{
 			Channel: task.Channel,
 			ChatID:  task.ChatID,
-			Content: fmt.Sprintf("Task %s is now ready and scheduled to run.", task.ID),
+			Content: fmt.Sprintf("Task %s is now ready and scheduled to run.", taskLabel(task)),
 		})
 	}
+}
+
+// generateTaskSummary asks planner LLM for a concise one-line task summary.
+// The ctx parameter controls LLM call lifecycle and request carries original user input.
+// It returns a normalized short summary with fallback when model call fails.
+func (al *AgentLoop) generateTaskSummary(ctx context.Context, request string) string {
+	fallback := fallbackTaskSummary(request)
+	planner := al.getPlannerAgent()
+	if planner == nil || planner.Provider == nil {
+		return fallback
+	}
+
+	resp, err := planner.Provider.Chat(ctx, []providers.Message{
+		{Role: "system", Content: "You generate concise task labels for tracking. Return one short line only."},
+		{Role: "user", Content: "Summarize this task in 6-14 words, preserve user language, no markdown, no quotes:\n" + request},
+	}, nil, planner.Model, map[string]any{
+		"max_tokens":  80,
+		"temperature": 0,
+	})
+	if err != nil || resp == nil {
+		return fallback
+	}
+
+	label := normalizeTaskSummary(resp.Content)
+	if label == "" {
+		return fallback
+	}
+	return label
+}
+
+// fallbackTaskSummary builds a deterministic short summary from raw request text.
+// The request parameter may contain multiline user content.
+// It returns a compact single-line fallback summary.
+func fallbackTaskSummary(request string) string {
+	normalized := normalizeTaskSummary(request)
+	if normalized == "" {
+		return "task"
+	}
+	return normalized
+}
+
+// taskLabel formats task identifier with optional summary.
+// The task parameter is a persisted pipeline task snapshot.
+// It returns human-readable ID text for user-facing messages.
+func taskLabel(task *PipelineTask) string {
+	if task == nil {
+		return "n/a"
+	}
+	if task.Summary == "" {
+		return task.ID
+	}
+	return fmt.Sprintf("%s [%s]", task.ID, task.Summary)
 }
 
 // decideTaskSchedule asks LLM whether the new task should run in parallel or wait.
@@ -421,7 +474,14 @@ func buildPlannerDelegationPrompt(task *PipelineTask) string {
 	sb.WriteString("Task tracking id: ")
 	sb.WriteString(task.ID)
 	sb.WriteString("\n")
+	if strings.TrimSpace(task.Summary) != "" {
+		sb.WriteString("Task short description: ")
+		sb.WriteString(task.Summary)
+		sb.WriteString("\n")
+	}
 	sb.WriteString("Use tools to classify work, break it down, and delegate worker steps when needed.\n")
+	sb.WriteString("For Skills workflows, prefer find_skills then install_skill, then read the installed SKILL.md and execute steps.\n")
+	sb.WriteString("For MCP workflows (especially remote MCP), use remote_mcp to add/list servers, list remote tools, and call the required remote tool.\n")
 	sb.WriteString("When spawning workers, include explicit labels so progress is traceable.\n")
 	sb.WriteString("Always produce a final status summary with success/failure and next actions.\n\n")
 	sb.WriteString("User request:\n")
@@ -434,15 +494,15 @@ func buildPlannerDelegationPrompt(task *PipelineTask) string {
 // The raw parameter is a user message such as "retry task-3".
 // It returns task ID and whether parsing succeeded.
 func parseRetryTaskID(raw string) (string, bool) {
-	parts := strings.Fields(strings.TrimSpace(strings.ToLower(raw)))
-	if len(parts) != 2 || parts[0] != "retry" {
+	parts := strings.Fields(strings.TrimSpace(raw))
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "retry") {
 		return "", false
 	}
 	id := strings.TrimSpace(parts[1])
 	if id == "" {
 		return "", false
 	}
-	if !strings.HasPrefix(id, "task-") {
+	if !strings.HasPrefix(strings.ToLower(id), "task-") {
 		return "", false
 	}
 	return id, true
@@ -452,15 +512,15 @@ func parseRetryTaskID(raw string) (string, bool) {
 // The raw parameter is a user message such as "parallel task-2".
 // It returns task ID and whether parsing succeeded.
 func parseParallelTaskID(raw string) (string, bool) {
-	parts := strings.Fields(strings.TrimSpace(strings.ToLower(raw)))
+	parts := strings.Fields(strings.TrimSpace(raw))
 	if len(parts) != 2 {
 		return "", false
 	}
-	if parts[0] != "parallel" && parts[0] != "并行" {
+	if !strings.EqualFold(parts[0], "parallel") && parts[0] != "并行" {
 		return "", false
 	}
 	id := strings.TrimSpace(parts[1])
-	if id == "" || !strings.HasPrefix(id, "task-") {
+	if id == "" || !strings.HasPrefix(strings.ToLower(id), "task-") {
 		return "", false
 	}
 	return id, true
@@ -487,12 +547,12 @@ func (al *AgentLoop) maybeHandleTaskControlCommand(msg bus.InboundMessage) (stri
 			return fmt.Sprintf("Failed to switch %s to parallel: %s", id, err.Error()), true
 		}
 		if updated.Status != TaskStatusQueued {
-			return fmt.Sprintf("Task %s is already %s and cannot be switched to queued parallel mode.", id, updated.Status), true
+			return fmt.Sprintf("Task %s is already %s and cannot be switched to queued parallel mode.", taskLabel(updated), updated.Status), true
 		}
 		if dispatched {
-			return fmt.Sprintf("Task %s switched to parallel mode and scheduled now.", id), true
+			return fmt.Sprintf("Task %s switched to parallel mode and scheduled now.", taskLabel(updated)), true
 		}
-		return fmt.Sprintf("Task %s is already queued for execution in parallel mode.", id), true
+		return fmt.Sprintf("Task %s is already queued for execution in parallel mode.", taskLabel(updated)), true
 	}
 
 	id, ok := parseRetryTaskID(msg.Content)
@@ -507,9 +567,9 @@ func (al *AgentLoop) maybeHandleTaskControlCommand(msg bus.InboundMessage) (stri
 		return "You can only retry tasks from the current conversation.", true
 	}
 
-	newTask, err := al.taskPipeline.EnqueueTask(task.Channel, task.ChatID, task.SenderID, task.Request)
+	newTask, err := al.taskPipeline.EnqueueTask(task.Channel, task.ChatID, task.SenderID, task.Request, task.Summary)
 	if err != nil {
 		return fmt.Sprintf("Failed to retry %s: %s", id, err.Error()), true
 	}
-	return fmt.Sprintf("Retried %s as %s.", id, newTask.ID), true
+	return fmt.Sprintf("Retried %s as %s.", id, taskLabel(newTask)), true
 }

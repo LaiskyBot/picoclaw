@@ -3,8 +3,10 @@ package agent
 import (
 	"context"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/config"
@@ -20,7 +22,7 @@ func TestTaskPipeline_PersistenceAndStatus(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	tp := NewTaskPipeline(tmpDir, 0)
-	task, err := tp.EnqueueTask("telegram", "chat-1", "user-1", "build project")
+	task, err := tp.EnqueueTask("telegram", "chat-1", "user-1", "build project", "build project")
 	require.NoError(t, err)
 	require.NotNil(t, task)
 
@@ -49,7 +51,7 @@ func TestTaskPipeline_MarkOrphanedOnRestart(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	tp := NewTaskPipeline(tmpDir, 0)
-	task, err := tp.EnqueueTask("telegram", "chat-2", "user-2", "long running")
+	task, err := tp.EnqueueTask("telegram", "chat-2", "user-2", "long running", "long running")
 	require.NoError(t, err)
 	require.True(t, tp.MarkRunning(task.ID, "planner"))
 
@@ -92,7 +94,8 @@ func TestAgentLoop_ProcessMessage_DelegatesExternalTasks(t *testing.T) {
 		Content:  "Please run a complex job",
 	})
 	require.NoError(t, err)
-	require.True(t, strings.Contains(response, "Task task-1 accepted"))
+	require.True(t, strings.Contains(response, "Task "))
+	require.True(t, strings.Contains(response, "accepted"))
 
 	statusResponse, err := al.processMessage(context.Background(), bus.InboundMessage{
 		Channel:  "telegram",
@@ -102,7 +105,8 @@ func TestAgentLoop_ProcessMessage_DelegatesExternalTasks(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Contains(t, statusResponse, "Task status:")
-	require.Contains(t, statusResponse, "task-1")
+	require.Contains(t, statusResponse, "task-")
+	require.Contains(t, statusResponse, "summary=")
 }
 
 // TestTaskPipeline_PromoteRunnableQueuedTasks verifies waiting tasks are promoted when dependencies finish.
@@ -115,7 +119,7 @@ func TestTaskPipeline_PromoteRunnableQueuedTasks(t *testing.T) {
 
 	tp := NewTaskPipeline(tmpDir, 0)
 
-	task1, err := tp.EnqueueTask("telegram", "chat-1", "user-1", "first")
+	task1, err := tp.EnqueueTask("telegram", "chat-1", "user-1", "first", "first")
 	require.NoError(t, err)
 	require.True(t, tp.MarkRunning(task1.ID, "planner"))
 
@@ -123,6 +127,7 @@ func TestTaskPipeline_PromoteRunnableQueuedTasks(t *testing.T) {
 		"telegram",
 		"chat-1",
 		"user-1",
+		"second",
 		"second",
 		TaskExecutionModeWait,
 		[]string{task1.ID},
@@ -154,6 +159,7 @@ func TestTaskPipeline_ForceParallelDispatch(t *testing.T) {
 		"telegram",
 		"chat-1",
 		"user-1",
+		"long task",
 		"long task",
 		TaskExecutionModeWait,
 		[]string{"task-999"},
@@ -195,4 +201,24 @@ func TestParseParallelTaskID(t *testing.T) {
 
 	_, ok = parseParallelTaskID("run task-2")
 	require.False(t, ok)
+}
+
+// TestBuildTaskID verifies task IDs include UTC timestamp and sequence components.
+// It formats a deterministic time and checks stable task ID output.
+// It returns no value and fails test on mismatches.
+func TestBuildTaskID(t *testing.T) {
+	ts := time.Date(2026, time.February, 25, 16, 40, 11, 0, time.UTC)
+	id := buildTaskID(ts, 6)
+
+	require.Equal(t, "task-20260225T164011Z-0006", id)
+	require.Regexp(t, regexp.MustCompile(`^task-\d{8}T\d{6}Z-\d{4}$`), id)
+}
+
+// TestParseRetryTaskID_PreservesCase verifies command parsing does not lowercase task IDs.
+// It checks that mixed-case timestamp tokens are preserved for map lookups.
+// It returns no value and fails test on mismatches.
+func TestParseRetryTaskID_PreservesCase(t *testing.T) {
+	id, ok := parseRetryTaskID("retry task-20260225T164011Z-0006")
+	require.True(t, ok)
+	require.Equal(t, "task-20260225T164011Z-0006", id)
 }

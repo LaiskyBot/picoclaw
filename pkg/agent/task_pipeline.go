@@ -36,23 +36,24 @@ const (
 // PipelineTask stores the end-to-end state of a delegated background task.
 // It includes user origin metadata, planner execution status, and worker updates.
 type PipelineTask struct {
-	ID            string   `json:"id"`
-	Channel       string   `json:"channel"`
-	ChatID        string   `json:"chat_id"`
-	SenderID      string   `json:"sender_id"`
-	Request       string   `json:"request"`
-	ExecutionMode string   `json:"execution_mode,omitempty"`
-	WaitForTaskID []string `json:"wait_for_task_id,omitempty"`
-	DispatchQueued bool    `json:"dispatch_queued,omitempty"`
-	PlannerAgent  string   `json:"planner_agent"`
-	Status        string   `json:"status"`
-	CreatedAtUTC  int64    `json:"created_at_utc"`
-	UpdatedAtUTC  int64    `json:"updated_at_utc"`
-	StartedAtUTC  int64    `json:"started_at_utc,omitempty"`
-	FinishedAtUTC int64    `json:"finished_at_utc,omitempty"`
-	PlannerResult string   `json:"planner_result,omitempty"`
-	Error         string   `json:"error,omitempty"`
-	WorkerEvents  []string `json:"worker_events,omitempty"`
+	ID             string   `json:"id"`
+	Summary        string   `json:"summary,omitempty"`
+	Channel        string   `json:"channel"`
+	ChatID         string   `json:"chat_id"`
+	SenderID       string   `json:"sender_id"`
+	Request        string   `json:"request"`
+	ExecutionMode  string   `json:"execution_mode,omitempty"`
+	WaitForTaskID  []string `json:"wait_for_task_id,omitempty"`
+	DispatchQueued bool     `json:"dispatch_queued,omitempty"`
+	PlannerAgent   string   `json:"planner_agent"`
+	Status         string   `json:"status"`
+	CreatedAtUTC   int64    `json:"created_at_utc"`
+	UpdatedAtUTC   int64    `json:"updated_at_utc"`
+	StartedAtUTC   int64    `json:"started_at_utc,omitempty"`
+	FinishedAtUTC  int64    `json:"finished_at_utc,omitempty"`
+	PlannerResult  string   `json:"planner_result,omitempty"`
+	Error          string   `json:"error,omitempty"`
+	WorkerEvents   []string `json:"worker_events,omitempty"`
 }
 
 // taskPipelineSnapshot is the on-disk format of TaskPipeline.
@@ -99,12 +100,13 @@ func NewTaskPipeline(workspace string, timeout time.Duration) *TaskPipeline {
 // EnqueueTask appends a new user task into the background queue.
 // The channel/chatID/senderID identify task origin and request carries user intent.
 // It returns the created task record.
-func (tp *TaskPipeline) EnqueueTask(channel, chatID, senderID, request string) (*PipelineTask, error) {
+func (tp *TaskPipeline) EnqueueTask(channel, chatID, senderID, request, summary string) (*PipelineTask, error) {
 	return tp.EnqueueTaskWithScheduling(
 		channel,
 		chatID,
 		senderID,
 		request,
+		summary,
 		TaskExecutionModeParallel,
 		nil,
 		true,
@@ -120,6 +122,7 @@ func (tp *TaskPipeline) EnqueueTaskWithScheduling(
 	chatID,
 	senderID,
 	request,
+	summary,
 	executionMode string,
 	waitForTaskIDs []string,
 	dispatchNow bool,
@@ -127,22 +130,24 @@ func (tp *TaskPipeline) EnqueueTaskWithScheduling(
 	nowUTC := time.Now().UTC().UnixMilli()
 	normalizedMode := normalizeExecutionMode(executionMode)
 	uniqWaitForIDs := uniqueTaskIDs(waitForTaskIDs)
+	normalizedSummary := normalizeTaskSummary(summary)
 
 	tp.mu.Lock()
-	taskID := fmt.Sprintf("task-%d", tp.nextID)
+	taskID := buildTaskID(time.UnixMilli(nowUTC).UTC(), tp.nextID)
 	tp.nextID++
 	task := &PipelineTask{
-		ID:           taskID,
-		Channel:      channel,
-		ChatID:       chatID,
-		SenderID:     senderID,
-		Request:      request,
-		ExecutionMode: normalizedMode,
-		WaitForTaskID: uniqWaitForIDs,
+		ID:             taskID,
+		Summary:        normalizedSummary,
+		Channel:        channel,
+		ChatID:         chatID,
+		SenderID:       senderID,
+		Request:        request,
+		ExecutionMode:  normalizedMode,
+		WaitForTaskID:  uniqWaitForIDs,
 		DispatchQueued: dispatchNow,
-		Status:       TaskStatusQueued,
-		CreatedAtUTC: nowUTC,
-		UpdatedAtUTC: nowUTC,
+		Status:         TaskStatusQueued,
+		CreatedAtUTC:   nowUTC,
+		UpdatedAtUTC:   nowUTC,
 	}
 	tp.tasks[taskID] = task
 	saveErr := tp.saveLocked()
@@ -383,6 +388,9 @@ func (tp *TaskPipeline) BuildStatusReply(channel, chatID, senderID string) strin
 	sb.WriteString("Task status:\n")
 	for _, task := range items {
 		fmt.Fprintf(&sb, "- %s: %s", task.ID, task.Status)
+		if task.Summary != "" {
+			fmt.Fprintf(&sb, " [summary=%s]", task.Summary)
+		}
 		if task.Status == TaskStatusQueued {
 			if task.DispatchQueued {
 				sb.WriteString(" (ready)")
@@ -576,6 +584,9 @@ func (tp *TaskPipeline) BuildConversationStatusSummary(channel, chatID, senderID
 	var sb strings.Builder
 	for _, task := range tasks {
 		fmt.Fprintf(&sb, "- %s: %s", task.ID, task.Status)
+		if task.Summary != "" {
+			fmt.Fprintf(&sb, " [summary=%s]", task.Summary)
+		}
 		if task.Status == TaskStatusQueued {
 			if task.DispatchQueued {
 				sb.WriteString(" (ready)")
@@ -608,6 +619,30 @@ func normalizeExecutionMode(mode string) string {
 	default:
 		return TaskExecutionModeParallel
 	}
+}
+
+// normalizeTaskSummary normalizes one-line task summary text.
+// The summary parameter may contain extra spaces or line breaks.
+// It returns a compact single-line summary with length cap.
+func normalizeTaskSummary(summary string) string {
+	normalized := strings.Join(strings.Fields(strings.TrimSpace(summary)), " ")
+	if normalized == "" {
+		return ""
+	}
+	if len(normalized) > 96 {
+		return normalized[:93] + "..."
+	}
+	return normalized
+}
+
+// buildTaskID returns a stable task ID composed of UTC timestamp and sequence.
+// The nowUTC parameter is the current UTC time and sequence is a process-local increment.
+// It returns an identifier in format task-YYYYMMDDTHHMMSSZ-NNNN.
+func buildTaskID(nowUTC time.Time, sequence int) string {
+	if sequence < 0 {
+		sequence = 0
+	}
+	return fmt.Sprintf("task-%s-%04d", nowUTC.UTC().Format("20060102T150405Z"), sequence)
 }
 
 // uniqueTaskIDs removes duplicates and empty values while preserving order.
