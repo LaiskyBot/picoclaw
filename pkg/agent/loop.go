@@ -35,6 +35,7 @@ type AgentLoop struct {
 	registry       *AgentRegistry
 	state          *state.Manager
 	taskPipeline   *TaskPipeline
+	taskMaxParallel int
 	running        atomic.Bool
 	summarizing    sync.Map
 	fallback       *providers.FallbackChain
@@ -73,13 +74,14 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 	}
 
 	return &AgentLoop{
-		bus:          msgBus,
-		cfg:          cfg,
-		registry:     registry,
-		state:        stateManager,
-		taskPipeline: taskPipeline,
-		summarizing:  sync.Map{},
-		fallback:     fallbackChain,
+		bus:             msgBus,
+		cfg:             cfg,
+		registry:        registry,
+		state:           stateManager,
+		taskPipeline:    taskPipeline,
+		taskMaxParallel: cfg.Agents.Defaults.TaskMaxParallel,
+		summarizing:     sync.Map{},
+		fallback:        fallbackChain,
 	}
 }
 
@@ -310,7 +312,47 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			return al.taskPipeline.BuildStatusReply(msg.Channel, msg.ChatID, msg.SenderID), nil
 		}
 
-		task, err := al.taskPipeline.EnqueueTask(msg.Channel, msg.ChatID, msg.SenderID, msg.Content)
+		activeTasks := al.taskPipeline.ListActiveConversationTasks(msg.Channel, msg.ChatID, msg.SenderID)
+		scheduleDecision := taskScheduleDecision{Decision: TaskExecutionModeParallel}
+		if len(activeTasks) > 0 {
+			decision, scheduleErr := al.decideTaskSchedule(ctx, msg, activeTasks)
+			if scheduleErr != nil {
+				scheduleDecision = taskScheduleDecision{
+					Decision:  "ask_user",
+					Reason:    fmt.Sprintf("scheduler_error: %s", scheduleErr.Error()),
+					DependsOn: collectTaskIDs(activeTasks),
+					Question:  "I cannot safely infer dependencies. Should this run in parallel or wait?",
+				}
+			} else {
+				scheduleDecision = decision
+			}
+		}
+
+		dispatchNow := scheduleDecision.Decision == TaskExecutionModeParallel
+		if scheduleDecision.Decision == "ask_user" {
+			dispatchNow = false
+			if len(scheduleDecision.DependsOn) == 0 {
+				scheduleDecision.DependsOn = collectTaskIDs(activeTasks)
+			}
+		}
+		if scheduleDecision.Decision == TaskExecutionModeWait {
+			dispatchNow = false
+		}
+
+		executionMode := scheduleDecision.Decision
+		if executionMode == "ask_user" {
+			executionMode = TaskExecutionModeWait
+		}
+
+		task, err := al.taskPipeline.EnqueueTaskWithScheduling(
+			msg.Channel,
+			msg.ChatID,
+			msg.SenderID,
+			msg.Content,
+			executionMode,
+			scheduleDecision.DependsOn,
+			dispatchNow,
+		)
 		if err != nil {
 			logger.ErrorCF("agent", "Failed to enqueue delegated task", map[string]any{
 				"channel": msg.Channel,
@@ -318,6 +360,31 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 				"error":   err.Error(),
 			})
 			return "Failed to enqueue your task for background planning. Please retry.", nil
+		}
+
+		if scheduleDecision.Decision == "ask_user" {
+			question := scheduleDecision.Question
+			if strings.TrimSpace(question) == "" {
+				question = "Should I run this task in parallel or wait for currently running tasks to finish?"
+			}
+			return fmt.Sprintf(
+				"Task %s is queued in waiting mode. %s Reply with 'parallel %s' to run it now.",
+				task.ID,
+				question,
+				task.ID,
+			), nil
+		}
+
+		if !dispatchNow {
+			if len(scheduleDecision.DependsOn) == 0 {
+				return fmt.Sprintf("Task %s accepted and queued to wait for existing tasks.", task.ID), nil
+			}
+			return fmt.Sprintf(
+				"Task %s accepted and waiting for %s. Reply with 'parallel %s' if you want to force parallel execution.",
+				task.ID,
+				strings.Join(scheduleDecision.DependsOn, ", "),
+				task.ID,
+			), nil
 		}
 
 		return fmt.Sprintf(
@@ -398,10 +465,21 @@ func (al *AgentLoop) processSystemMessage(ctx context.Context, msg bus.InboundMe
 
 		task, ok := al.taskPipeline.GetTaskByID(originChatID)
 		if ok {
+			elapsed := "unknown"
+			if task.StartedAtUTC > 0 {
+				elapsed = (time.Since(time.UnixMilli(task.StartedAtUTC).UTC())).Round(time.Second).String()
+			}
 			al.bus.PublishOutbound(bus.OutboundMessage{
 				Channel: task.Channel,
 				ChatID:  task.ChatID,
-				Content: fmt.Sprintf("Worker update for %s:\n%s", task.ID, msg.Content),
+				Content: fmt.Sprintf(
+					"Worker update for %s.\n- status: %s\n- started_at_utc: %s\n- elapsed: %s\n- update: %s",
+					task.ID,
+					task.Status,
+					formatUnixMilliUTC(task.StartedAtUTC),
+					elapsed,
+					msg.Content,
+				),
 			})
 		}
 		return "", nil

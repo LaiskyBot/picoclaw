@@ -28,6 +28,11 @@ const (
 	TaskStatusOrphaned = "orphaned"
 )
 
+const (
+	TaskExecutionModeParallel = "parallel"
+	TaskExecutionModeWait     = "wait"
+)
+
 // PipelineTask stores the end-to-end state of a delegated background task.
 // It includes user origin metadata, planner execution status, and worker updates.
 type PipelineTask struct {
@@ -36,6 +41,9 @@ type PipelineTask struct {
 	ChatID        string   `json:"chat_id"`
 	SenderID      string   `json:"sender_id"`
 	Request       string   `json:"request"`
+	ExecutionMode string   `json:"execution_mode,omitempty"`
+	WaitForTaskID []string `json:"wait_for_task_id,omitempty"`
+	DispatchQueued bool    `json:"dispatch_queued,omitempty"`
 	PlannerAgent  string   `json:"planner_agent"`
 	Status        string   `json:"status"`
 	CreatedAtUTC  int64    `json:"created_at_utc"`
@@ -92,7 +100,33 @@ func NewTaskPipeline(workspace string, timeout time.Duration) *TaskPipeline {
 // The channel/chatID/senderID identify task origin and request carries user intent.
 // It returns the created task record.
 func (tp *TaskPipeline) EnqueueTask(channel, chatID, senderID, request string) (*PipelineTask, error) {
+	return tp.EnqueueTaskWithScheduling(
+		channel,
+		chatID,
+		senderID,
+		request,
+		TaskExecutionModeParallel,
+		nil,
+		true,
+	)
+}
+
+// EnqueueTaskWithScheduling appends a new user task with explicit scheduling controls.
+// The executionMode controls preferred strategy, waitForTaskIDs tracks dependencies,
+// and dispatchNow decides whether it is immediately dispatched to planner workers.
+// It returns the created task record.
+func (tp *TaskPipeline) EnqueueTaskWithScheduling(
+	channel,
+	chatID,
+	senderID,
+	request,
+	executionMode string,
+	waitForTaskIDs []string,
+	dispatchNow bool,
+) (*PipelineTask, error) {
 	nowUTC := time.Now().UTC().UnixMilli()
+	normalizedMode := normalizeExecutionMode(executionMode)
+	uniqWaitForIDs := uniqueTaskIDs(waitForTaskIDs)
 
 	tp.mu.Lock()
 	taskID := fmt.Sprintf("task-%d", tp.nextID)
@@ -103,6 +137,9 @@ func (tp *TaskPipeline) EnqueueTask(channel, chatID, senderID, request string) (
 		ChatID:       chatID,
 		SenderID:     senderID,
 		Request:      request,
+		ExecutionMode: normalizedMode,
+		WaitForTaskID: uniqWaitForIDs,
+		DispatchQueued: dispatchNow,
 		Status:       TaskStatusQueued,
 		CreatedAtUTC: nowUTC,
 		UpdatedAtUTC: nowUTC,
@@ -114,9 +151,17 @@ func (tp *TaskPipeline) EnqueueTask(channel, chatID, senderID, request string) (
 		return nil, saveErr
 	}
 
+	if !dispatchNow {
+		return clonePipelineTask(task), nil
+	}
+
 	select {
 	case tp.queue <- taskID:
 	default:
+		tp.mu.Lock()
+		task.DispatchQueued = false
+		_ = tp.saveLocked()
+		tp.mu.Unlock()
 		return nil, fmt.Errorf("task queue is full")
 	}
 
@@ -127,17 +172,30 @@ func (tp *TaskPipeline) EnqueueTask(channel, chatID, senderID, request string) (
 // The ctx parameter controls waiting lifecycle.
 // It returns task details and a boolean indicating whether dequeue succeeded.
 func (tp *TaskPipeline) Dequeue(ctx context.Context) (*PipelineTask, bool) {
-	select {
-	case taskID := <-tp.queue:
-		tp.mu.RLock()
-		task, ok := tp.tasks[taskID]
-		tp.mu.RUnlock()
-		if !ok {
+	for {
+		select {
+		case taskID := <-tp.queue:
+			tp.mu.Lock()
+			task, ok := tp.tasks[taskID]
+			if !ok {
+				tp.mu.Unlock()
+				continue
+			}
+			if task.Status != TaskStatusQueued || !task.DispatchQueued {
+				tp.mu.Unlock()
+				continue
+			}
+			task.DispatchQueued = false
+			task.UpdatedAtUTC = time.Now().UTC().UnixMilli()
+			if err := tp.saveLocked(); err != nil {
+				logger.WarnCF("agent", "Failed to persist dequeue state", map[string]any{"task_id": taskID, "error": err.Error()})
+			}
+			out := clonePipelineTask(task)
+			tp.mu.Unlock()
+			return out, true
+		case <-ctx.Done():
 			return nil, false
 		}
-		return clonePipelineTask(task), true
-	case <-ctx.Done():
-		return nil, false
 	}
 }
 
@@ -154,6 +212,7 @@ func (tp *TaskPipeline) MarkRunning(taskID, plannerAgent string) bool {
 	}
 	nowUTC := time.Now().UTC().UnixMilli()
 	task.Status = TaskStatusRunning
+	task.DispatchQueued = false
 	task.PlannerAgent = plannerAgent
 	task.StartedAtUTC = nowUTC
 	task.UpdatedAtUTC = nowUTC
@@ -324,6 +383,19 @@ func (tp *TaskPipeline) BuildStatusReply(channel, chatID, senderID string) strin
 	sb.WriteString("Task status:\n")
 	for _, task := range items {
 		fmt.Fprintf(&sb, "- %s: %s", task.ID, task.Status)
+		if task.Status == TaskStatusQueued {
+			if task.DispatchQueued {
+				sb.WriteString(" (ready)")
+			} else {
+				sb.WriteString(" (waiting)")
+			}
+		}
+		if task.ExecutionMode != "" {
+			fmt.Fprintf(&sb, " (mode=%s)", task.ExecutionMode)
+		}
+		if len(task.WaitForTaskID) > 0 {
+			fmt.Fprintf(&sb, " (depends_on=%s)", strings.Join(task.WaitForTaskID, ","))
+		}
 		if task.PlannerAgent != "" {
 			fmt.Fprintf(&sb, " (planner=%s)", task.PlannerAgent)
 		}
@@ -337,6 +409,255 @@ func (tp *TaskPipeline) BuildStatusReply(channel, chatID, senderID string) strin
 	}
 
 	return strings.TrimSpace(sb.String())
+}
+
+// CountRunning returns the number of currently running tasks.
+// It inspects all tasks in the pipeline without conversation filtering.
+// It returns a non-negative running task count.
+func (tp *TaskPipeline) CountRunning() int {
+	tp.mu.RLock()
+	defer tp.mu.RUnlock()
+
+	count := 0
+	for _, task := range tp.tasks {
+		if task.Status == TaskStatusRunning {
+			count++
+		}
+	}
+
+	return count
+}
+
+// ListActiveConversationTasks returns queued and running tasks in a conversation.
+// The channel/chatID/senderID filters scope task visibility for requester context.
+// It returns tasks ordered by created time ascending.
+func (tp *TaskPipeline) ListActiveConversationTasks(channel, chatID, senderID string) []*PipelineTask {
+	tp.mu.RLock()
+	defer tp.mu.RUnlock()
+
+	items := make([]*PipelineTask, 0)
+	for _, task := range tp.tasks {
+		if task.Channel != channel || task.ChatID != chatID {
+			continue
+		}
+		if senderID != "" && task.SenderID != "" && task.SenderID != senderID {
+			continue
+		}
+		if task.Status != TaskStatusQueued && task.Status != TaskStatusRunning {
+			continue
+		}
+		items = append(items, clonePipelineTask(task))
+	}
+
+	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAtUTC < items[j].CreatedAtUTC })
+	return items
+}
+
+// PromoteRunnableQueuedTasks dispatches queued tasks that are now runnable.
+// The maxCount parameter caps how many tasks are promoted in this call.
+// It returns promoted task snapshots in created order.
+func (tp *TaskPipeline) PromoteRunnableQueuedTasks(maxCount int) []*PipelineTask {
+	if maxCount <= 0 {
+		return nil
+	}
+
+	tp.mu.Lock()
+	nowUTC := time.Now().UTC().UnixMilli()
+	candidates := make([]*PipelineTask, 0)
+	for _, task := range tp.tasks {
+		if task.Status != TaskStatusQueued || task.DispatchQueued {
+			continue
+		}
+		candidates = append(candidates, task)
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].CreatedAtUTC < candidates[j].CreatedAtUTC })
+
+	promoted := make([]*PipelineTask, 0, maxCount)
+	for _, task := range candidates {
+		if len(promoted) >= maxCount {
+			break
+		}
+		if !tp.isTaskRunnableLocked(task) {
+			continue
+		}
+		task.DispatchQueued = true
+		task.UpdatedAtUTC = nowUTC
+		promoted = append(promoted, clonePipelineTask(task))
+	}
+
+	if len(promoted) > 0 {
+		if err := tp.saveLocked(); err != nil {
+			logger.WarnCF("agent", "Failed to persist promoted tasks", map[string]any{"error": err.Error()})
+		}
+	}
+	tp.mu.Unlock()
+
+	if len(promoted) == 0 {
+		return nil
+	}
+
+	for _, task := range promoted {
+		select {
+		case tp.queue <- task.ID:
+		default:
+			logger.WarnCF("agent", "Failed to dispatch promoted task because queue is full", map[string]any{"task_id": task.ID})
+			tp.mu.Lock()
+			stored, ok := tp.tasks[task.ID]
+			if ok && stored.Status == TaskStatusQueued {
+				stored.DispatchQueued = false
+				stored.UpdatedAtUTC = time.Now().UTC().UnixMilli()
+				if err := tp.saveLocked(); err != nil {
+					logger.WarnCF("agent", "Failed to rollback promoted task state", map[string]any{"task_id": task.ID, "error": err.Error()})
+				}
+			}
+			tp.mu.Unlock()
+		}
+	}
+
+	return promoted
+}
+
+// ForceParallelDispatch marks a queued task as parallel and schedules it immediately.
+// The taskID identifies the queued task that should be promoted to dispatch queue.
+// It returns the updated task snapshot and whether a change happened.
+func (tp *TaskPipeline) ForceParallelDispatch(taskID string) (*PipelineTask, bool, error) {
+	tp.mu.Lock()
+	task, ok := tp.tasks[taskID]
+	if !ok {
+		tp.mu.Unlock()
+		return nil, false, fmt.Errorf("task %s not found", taskID)
+	}
+	if task.Status != TaskStatusQueued {
+		out := clonePipelineTask(task)
+		tp.mu.Unlock()
+		return out, false, nil
+	}
+
+	shouldDispatch := !task.DispatchQueued
+	task.ExecutionMode = TaskExecutionModeParallel
+	task.WaitForTaskID = nil
+	task.DispatchQueued = true
+	task.UpdatedAtUTC = time.Now().UTC().UnixMilli()
+	if err := tp.saveLocked(); err != nil {
+		tp.mu.Unlock()
+		return nil, false, err
+	}
+	out := clonePipelineTask(task)
+	tp.mu.Unlock()
+
+	if shouldDispatch {
+		select {
+		case tp.queue <- taskID:
+		default:
+			tp.mu.Lock()
+			stored, ok := tp.tasks[taskID]
+			if ok && stored.Status == TaskStatusQueued {
+				stored.DispatchQueued = false
+				stored.UpdatedAtUTC = time.Now().UTC().UnixMilli()
+				_ = tp.saveLocked()
+			}
+			tp.mu.Unlock()
+			return nil, false, fmt.Errorf("task queue is full")
+		}
+	}
+
+	return out, shouldDispatch, nil
+}
+
+// BuildConversationStatusSummary returns queued/running status lines for scheduler prompts.
+// The channel/chatID/senderID scopes tasks to current requester conversation.
+// It returns a compact multi-line summary suitable for LLM scheduling decisions.
+func (tp *TaskPipeline) BuildConversationStatusSummary(channel, chatID, senderID string) string {
+	tasks := tp.ListActiveConversationTasks(channel, chatID, senderID)
+	if len(tasks) == 0 {
+		return "(none)"
+	}
+
+	var sb strings.Builder
+	for _, task := range tasks {
+		fmt.Fprintf(&sb, "- %s: %s", task.ID, task.Status)
+		if task.Status == TaskStatusQueued {
+			if task.DispatchQueued {
+				sb.WriteString(" (ready)")
+			} else {
+				sb.WriteString(" (waiting)")
+			}
+		}
+		if task.ExecutionMode != "" {
+			fmt.Fprintf(&sb, " (mode=%s)", task.ExecutionMode)
+		}
+		if task.PlannerAgent != "" {
+			fmt.Fprintf(&sb, " (planner=%s)", task.PlannerAgent)
+		}
+		if len(task.WaitForTaskID) > 0 {
+			fmt.Fprintf(&sb, " (depends_on=%s)", strings.Join(task.WaitForTaskID, ","))
+		}
+		sb.WriteString("\n")
+	}
+
+	return strings.TrimSpace(sb.String())
+}
+
+// normalizeExecutionMode normalizes scheduling mode to supported values.
+// The mode parameter is caller-provided free text.
+// It returns either TaskExecutionModeParallel or TaskExecutionModeWait.
+func normalizeExecutionMode(mode string) string {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case TaskExecutionModeWait:
+		return TaskExecutionModeWait
+	default:
+		return TaskExecutionModeParallel
+	}
+}
+
+// uniqueTaskIDs removes duplicates and empty values while preserving order.
+// The ids parameter may include repeated task IDs.
+// It returns a sanitized unique slice.
+func uniqueTaskIDs(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(ids))
+	result := make([]string, 0, len(ids))
+	for _, id := range ids {
+		tid := strings.TrimSpace(id)
+		if tid == "" {
+			continue
+		}
+		if _, ok := seen[tid]; ok {
+			continue
+		}
+		seen[tid] = struct{}{}
+		result = append(result, tid)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// isTaskRunnableLocked determines whether a queued task can be dispatched now.
+// Caller must hold tp.mu lock before invoking this method.
+// It returns true when task dependencies are satisfied and runnable.
+func (tp *TaskPipeline) isTaskRunnableLocked(task *PipelineTask) bool {
+	if task == nil {
+		return false
+	}
+	if len(task.WaitForTaskID) == 0 {
+		return true
+	}
+
+	for _, depID := range task.WaitForTaskID {
+		dep, ok := tp.tasks[depID]
+		if !ok {
+			continue
+		}
+		if dep.Status == TaskStatusQueued || dep.Status == TaskStatusRunning {
+			return false
+		}
+	}
+
+	return true
 }
 
 // GetTaskByID returns a copy of task by ID.

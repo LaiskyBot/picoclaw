@@ -233,6 +233,15 @@ func TestDefaultConfig_MaxToolIterations(t *testing.T) {
 	}
 }
 
+// TestDefaultConfig_TaskMaxParallel verifies task parallelism has default value.
+func TestDefaultConfig_TaskMaxParallel(t *testing.T) {
+	cfg := DefaultConfig()
+
+	if cfg.Agents.Defaults.TaskMaxParallel != 4 {
+		t.Errorf("TaskMaxParallel should default to 4, got %d", cfg.Agents.Defaults.TaskMaxParallel)
+	}
+}
+
 // TestDefaultConfig_Temperature verifies temperature has default value
 func TestDefaultConfig_Temperature(t *testing.T) {
 	cfg := DefaultConfig()
@@ -342,6 +351,9 @@ func TestConfig_Complete(t *testing.T) {
 	}
 	if cfg.Agents.Defaults.MaxToolIterations == 0 {
 		t.Error("MaxToolIterations should not be zero")
+	}
+	if cfg.Agents.Defaults.TaskMaxParallel == 0 {
+		t.Error("TaskMaxParallel should not be zero")
 	}
 	if cfg.Gateway.Host != "127.0.0.1" {
 		t.Error("Gateway host should have default value")

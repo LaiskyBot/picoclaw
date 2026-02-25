@@ -104,3 +104,95 @@ func TestAgentLoop_ProcessMessage_DelegatesExternalTasks(t *testing.T) {
 	require.Contains(t, statusResponse, "Task status:")
 	require.Contains(t, statusResponse, "task-1")
 }
+
+// TestTaskPipeline_PromoteRunnableQueuedTasks verifies waiting tasks are promoted when dependencies finish.
+// It enqueues a running task and a dependent waiting task, then completes dependency and promotes queued task.
+// It returns no value and fails test on mismatches.
+func TestTaskPipeline_PromoteRunnableQueuedTasks(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "task-pipeline-promote-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	tp := NewTaskPipeline(tmpDir, 0)
+
+	task1, err := tp.EnqueueTask("telegram", "chat-1", "user-1", "first")
+	require.NoError(t, err)
+	require.True(t, tp.MarkRunning(task1.ID, "planner"))
+
+	task2, err := tp.EnqueueTaskWithScheduling(
+		"telegram",
+		"chat-1",
+		"user-1",
+		"second",
+		TaskExecutionModeWait,
+		[]string{task1.ID},
+		false,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, task2)
+
+	promoted := tp.PromoteRunnableQueuedTasks(2)
+	require.Len(t, promoted, 0)
+
+	require.True(t, tp.MarkPlannerCompleted(task1.ID, "done"))
+	promoted = tp.PromoteRunnableQueuedTasks(2)
+	require.Len(t, promoted, 1)
+	require.Equal(t, task2.ID, promoted[0].ID)
+	require.True(t, promoted[0].DispatchQueued)
+}
+
+// TestTaskPipeline_ForceParallelDispatch verifies queued waiting task can be forced into parallel dispatch.
+// It creates a waiting task and promotes it using ForceParallelDispatch.
+// It returns no value and fails test on mismatches.
+func TestTaskPipeline_ForceParallelDispatch(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "task-pipeline-force-parallel-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	tp := NewTaskPipeline(tmpDir, 0)
+	task, err := tp.EnqueueTaskWithScheduling(
+		"telegram",
+		"chat-1",
+		"user-1",
+		"long task",
+		TaskExecutionModeWait,
+		[]string{"task-999"},
+		false,
+	)
+	require.NoError(t, err)
+
+	updated, dispatched, err := tp.ForceParallelDispatch(task.ID)
+	require.NoError(t, err)
+	require.True(t, dispatched)
+	require.Equal(t, TaskExecutionModeParallel, updated.ExecutionMode)
+	require.Empty(t, updated.WaitForTaskID)
+	require.True(t, updated.DispatchQueued)
+}
+
+// TestParseTaskScheduleDecision verifies parser accepts fenced JSON classifier output.
+// It feeds markdown-wrapped JSON and checks normalized scheduling fields.
+// It returns no value and fails test on mismatches.
+func TestParseTaskScheduleDecision(t *testing.T) {
+	raw := "```json\n{\n  \"decision\": \"wait\",\n  \"reason\": \"depends on previous task\",\n  \"depends_on\": [\"task-1\", \"task-1\"],\n  \"question\": \"\"\n}\n```"
+
+	decision, err := parseTaskScheduleDecision(raw)
+	require.NoError(t, err)
+	require.Equal(t, TaskExecutionModeWait, decision.Decision)
+	require.Equal(t, "depends on previous task", decision.Reason)
+	require.Equal(t, []string{"task-1"}, decision.DependsOn)
+}
+
+// TestParseParallelTaskID verifies the force-parallel command parser.
+// It checks accepted and rejected command forms.
+// It returns no value and fails test on mismatches.
+func TestParseParallelTaskID(t *testing.T) {
+	id, ok := parseParallelTaskID("parallel task-2")
+	require.True(t, ok)
+	require.Equal(t, "task-2", id)
+
+	_, ok = parseParallelTaskID("parallel")
+	require.False(t, ok)
+
+	_, ok = parseParallelTaskID("run task-2")
+	require.False(t, ok)
+}
