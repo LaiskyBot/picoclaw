@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/providers/protocoltypes"
 )
 
@@ -134,8 +135,25 @@ func (p *Provider) Chat(
 		req.Header.Set("Authorization", "Bearer "+p.apiKey)
 	}
 
+	requestURL := sanitizedURL(req.URL)
+	logger.DebugCF("openai_compat", "Sending chat completion request", map[string]any{
+		"url":           requestURL,
+		"model":         model,
+		"messages":      len(messages),
+		"tools":         len(tools),
+		"request_bytes": len(jsonData),
+	})
+
+	start := time.Now()
+
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
+		logger.DebugCF("openai_compat", "Chat completion request failed before response", map[string]any{
+			"url":        requestURL,
+			"model":      model,
+			"latency_ms": time.Since(start).Milliseconds(),
+			"error":      err.Error(),
+		})
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 	defer resp.Body.Close()
@@ -146,7 +164,29 @@ func (p *Provider) Chat(
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API request failed:\n  Status: %d\n  Body:   %s", resp.StatusCode, string(body))
+		requestID := firstNonEmpty(
+			resp.Header.Get("x-request-id"),
+			resp.Header.Get("request-id"),
+			resp.Header.Get("cf-ray"),
+		)
+		bodyPreview := summarizeBody(body, 2000)
+
+		logger.DebugCF("openai_compat", "Chat completion non-200 response", map[string]any{
+			"url":            requestURL,
+			"model":          model,
+			"status_code":    resp.StatusCode,
+			"latency_ms":     time.Since(start).Milliseconds(),
+			"response_bytes": len(body),
+			"request_id":     requestID,
+			"server":         resp.Header.Get("server"),
+			"body_preview":   summarizeBody(body, 300),
+		})
+
+		errorText := fmt.Sprintf("API request failed:\n  Status: %d\n  URL:    %s\n  Model:  %s\n  Body:   %s", resp.StatusCode, requestURL, model, bodyPreview)
+		if requestID != "" {
+			errorText += fmt.Sprintf("\n  RequestID: %s", requestID)
+		}
+		return nil, fmt.Errorf("%s", errorText)
 	}
 
 	return parseResponse(body)
@@ -311,4 +351,41 @@ func asFloat(v any) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// sanitizedURL returns a URL string safe for logs by removing user info, query, and fragment.
+func sanitizedURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	copyURL := *u
+	copyURL.User = nil
+	copyURL.RawQuery = ""
+	copyURL.Fragment = ""
+	return copyURL.String()
+}
+
+// summarizeBody returns a compact single-line body preview with a max byte length.
+func summarizeBody(body []byte, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	text := strings.TrimSpace(string(body))
+	text = strings.ReplaceAll(text, "\n", "\\n")
+	text = strings.ReplaceAll(text, "\r", "")
+	if len(text) <= max {
+		return text
+	}
+	return text[:max] + "...(truncated)"
+}
+
+// firstNonEmpty returns the first non-empty trimmed string.
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }

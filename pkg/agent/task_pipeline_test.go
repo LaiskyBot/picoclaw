@@ -203,22 +203,34 @@ func TestParseParallelTaskID(t *testing.T) {
 	require.False(t, ok)
 }
 
-// TestBuildTaskID verifies task IDs include UTC timestamp and sequence components.
+// TestBuildTaskID verifies task IDs include UTC date and sequence components.
 // It formats a deterministic time and checks stable task ID output.
 // It returns no value and fails test on mismatches.
 func TestBuildTaskID(t *testing.T) {
 	ts := time.Date(2026, time.February, 25, 16, 40, 11, 0, time.UTC)
 	id := buildTaskID(ts, 6)
 
-	require.Equal(t, "task-20260225T164011Z-0006", id)
-	require.Regexp(t, regexp.MustCompile(`^task-\d{8}T\d{6}Z-\d{4}$`), id)
+	require.Equal(t, "task-2026-02-25-0006", id)
+	require.Regexp(t, regexp.MustCompile(`^task-\d{4}-\d{2}-\d{2}-\d{4}$`), id)
 }
 
 // TestParseRetryTaskID_PreservesCase verifies command parsing does not lowercase task IDs.
 // It checks that mixed-case timestamp tokens are preserved for map lookups.
 // It returns no value and fails test on mismatches.
 func TestParseRetryTaskID_PreservesCase(t *testing.T) {
-	id, ok := parseRetryTaskID("retry task-20260225T164011Z-0006")
+	id, ok := parseRetryTaskID("retry task-2026-02-25-0006")
 	require.True(t, ok)
-	require.Equal(t, "task-20260225T164011Z-0006", id)
+	require.Equal(t, "task-2026-02-25-0006", id)
+}
+
+// TestTaskPipeline_NextSequenceForDateLocked verifies sequence allocation increments and resets per UTC date.
+// It uses explicit date keys to validate deterministic day-boundary behavior.
+// It returns no value and fails test on mismatches.
+func TestTaskPipeline_NextSequenceForDateLocked(t *testing.T) {
+	tp := &TaskPipeline{nextSequence: 1}
+
+	require.Equal(t, 1, tp.nextSequenceForDateLocked("2026-02-25"))
+	require.Equal(t, 2, tp.nextSequenceForDateLocked("2026-02-25"))
+	require.Equal(t, 1, tp.nextSequenceForDateLocked("2026-02-26"))
+	require.Equal(t, 2, tp.nextSequenceForDateLocked("2026-02-26"))
 }

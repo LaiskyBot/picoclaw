@@ -221,6 +221,28 @@
       },
       "proxy": ""
     },
+    "mcp": {
+      "local": {
+        "filesystem": {
+          "type": "stdio",
+          "command": "npx",
+          "args": [
+            "-y",
+            "@modelcontextprotocol/server-filesystem",
+            "/tmp"
+          ]
+        }
+      },
+      "remote": {
+        "laisky": {
+          "type": "http",
+          "url": "https://mcp.laisky.com",
+          "headers": {
+            "Authorization": "Bearer sk-xxxxxxx"
+          }
+        }
+      }
+    },
     "cron": {
       "exec_timeout_minutes": 5
     },

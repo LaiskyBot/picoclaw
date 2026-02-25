@@ -468,8 +468,30 @@ type ExecConfig struct {
 	CustomDenyPatterns []string `json:"custom_deny_patterns" env:"PICOCLAW_TOOLS_EXEC_CUSTOM_DENY_PATTERNS"`
 }
 
+// MCPToolsConfig contains MCP server settings split by local and remote transports.
+type MCPToolsConfig struct {
+	Local  map[string]LocalMCPServerConfig  `json:"local,omitempty"`
+	Remote map[string]RemoteMCPServerConfig `json:"remote,omitempty"`
+}
+
+// LocalMCPServerConfig defines one local MCP server process launched via stdio.
+type LocalMCPServerConfig struct {
+	Type    string            `json:"type,omitempty"`
+	Command string            `json:"command"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+}
+
+// RemoteMCPServerConfig defines one remote MCP server endpoint reachable over HTTP.
+type RemoteMCPServerConfig struct {
+	Type    string            `json:"type,omitempty"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
 type ToolsConfig struct {
 	Web    WebToolsConfig    `json:"web"`
+	MCP    MCPToolsConfig    `json:"mcp,omitempty"`
 	Cron   CronToolsConfig   `json:"cron"`
 	Exec   ExecConfig        `json:"exec"`
 	Skills SkillsToolsConfig `json:"skills"`

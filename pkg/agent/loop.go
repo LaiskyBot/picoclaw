@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -145,7 +146,11 @@ func registerSharedTools(
 		)
 		agent.Tools.Register(tools.NewFindSkillsTool(registryMgr, searchCache))
 		agent.Tools.Register(tools.NewInstallSkillTool(registryMgr, agent.Workspace))
-		agent.Tools.Register(tools.NewRemoteMCPTool(agent.Workspace))
+		remoteMCPTool := tools.NewRemoteMCPTool(agent.Workspace)
+		if err := remoteMCPTool.BootstrapConfiguredServers(buildConfiguredRemoteMCPServers(cfg.Tools.MCP.Remote)); err != nil {
+			logger.WarnC("agent", fmt.Sprintf("failed to bootstrap configured remote MCP servers for agent %q: %v", agentID, err))
+		}
+		agent.Tools.Register(remoteMCPTool)
 
 		// Spawn tool with allowlist checker
 		subagentManager := tools.NewSubagentManager(provider, agent.Model, agent.Workspace, msgBus)
@@ -157,6 +162,34 @@ func registerSharedTools(
 		})
 		agent.Tools.Register(spawnTool)
 	}
+}
+
+// buildConfiguredRemoteMCPServers converts config remote MCP map into deterministic tool bootstrap inputs.
+// The remote parameter is keyed by server name.
+// It returns server entries sorted by name for stable behavior.
+func buildConfiguredRemoteMCPServers(remote map[string]config.RemoteMCPServerConfig) []tools.ConfiguredRemoteMCPServer {
+	if len(remote) == 0 {
+		return nil
+	}
+
+	names := make([]string, 0, len(remote))
+	for name := range remote {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	servers := make([]tools.ConfiguredRemoteMCPServer, 0, len(names))
+	for _, name := range names {
+		entry := remote[name]
+		servers = append(servers, tools.ConfiguredRemoteMCPServer{
+			Name:    name,
+			Type:    entry.Type,
+			URL:     entry.URL,
+			Headers: entry.Headers,
+		})
+	}
+
+	return servers
 }
 
 func (al *AgentLoop) Run(ctx context.Context) error {
@@ -278,6 +311,22 @@ func (al *AgentLoop) ProcessHeartbeat(ctx context.Context, content, channel, cha
 	})
 }
 
+// shouldDelegateToPipeline reports whether inbound channel should use async planner handoff.
+// The channel parameter is inbound transport identifier.
+// It returns true for user-facing chat channels and false for internal or local/testing channels.
+func (al *AgentLoop) shouldDelegateToPipeline(channel string) bool {
+	if constants.IsInternalChannel(channel) {
+		return false
+	}
+
+	switch strings.ToLower(strings.TrimSpace(channel)) {
+	case "telegram", "discord", "slack", "feishu", "line", "wecom", "onebot", "qq", "dingtalk", "maixcam", "whatsapp":
+		return true
+	default:
+		return false
+	}
+}
+
 func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage) (string, error) {
 	// Add message preview to log (show full content for error messages)
 	var logContent string
@@ -304,7 +353,7 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 		return response, nil
 	}
 
-	if msg.Channel == "telegram" && !constants.IsInternalChannel(msg.Channel) && al.taskPipeline != nil {
+	if al.shouldDelegateToPipeline(msg.Channel) && al.taskPipeline != nil {
 		if response, handled := al.maybeHandleTaskControlCommand(msg); handled {
 			return response, nil
 		}
@@ -313,39 +362,7 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			return al.taskPipeline.BuildStatusReply(msg.Channel, msg.ChatID, msg.SenderID), nil
 		}
 
-		activeTasks := al.taskPipeline.ListActiveConversationTasks(msg.Channel, msg.ChatID, msg.SenderID)
-		scheduleDecision := taskScheduleDecision{Decision: TaskExecutionModeParallel}
-		if len(activeTasks) > 0 {
-			decision, scheduleErr := al.decideTaskSchedule(ctx, msg, activeTasks)
-			if scheduleErr != nil {
-				scheduleDecision = taskScheduleDecision{
-					Decision:  "ask_user",
-					Reason:    fmt.Sprintf("scheduler_error: %s", scheduleErr.Error()),
-					DependsOn: collectTaskIDs(activeTasks),
-					Question:  "I cannot safely infer dependencies. Should this run in parallel or wait?",
-				}
-			} else {
-				scheduleDecision = decision
-			}
-		}
-
-		dispatchNow := scheduleDecision.Decision == TaskExecutionModeParallel
-		if scheduleDecision.Decision == "ask_user" {
-			dispatchNow = false
-			if len(scheduleDecision.DependsOn) == 0 {
-				scheduleDecision.DependsOn = collectTaskIDs(activeTasks)
-			}
-		}
-		if scheduleDecision.Decision == TaskExecutionModeWait {
-			dispatchNow = false
-		}
-
-		executionMode := scheduleDecision.Decision
-		if executionMode == "ask_user" {
-			executionMode = TaskExecutionModeWait
-		}
-
-		taskSummary := al.generateTaskSummary(ctx, msg.Content)
+		taskSummary := fallbackTaskSummary()
 
 		task, err := al.taskPipeline.EnqueueTaskWithScheduling(
 			msg.Channel,
@@ -353,9 +370,9 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			msg.SenderID,
 			msg.Content,
 			taskSummary,
-			executionMode,
-			scheduleDecision.DependsOn,
-			dispatchNow,
+			TaskExecutionModeParallel,
+			nil,
+			true,
 		)
 		if err != nil {
 			logger.ErrorCF("agent", "Failed to enqueue delegated task", map[string]any{
@@ -364,33 +381,6 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 				"error":   err.Error(),
 			})
 			return "Failed to enqueue your task for background planning. Please retry.", nil
-		}
-
-		if scheduleDecision.Decision == "ask_user" {
-			question := scheduleDecision.Question
-			if strings.TrimSpace(question) == "" {
-				question = "Should I run this task in parallel or wait for currently running tasks to finish?"
-			}
-			return fmt.Sprintf(
-				"Task %s [%s] is queued in waiting mode. %s Reply with 'parallel %s' to run it now.",
-				task.ID,
-				taskSummary,
-				question,
-				task.ID,
-			), nil
-		}
-
-		if !dispatchNow {
-			if len(scheduleDecision.DependsOn) == 0 {
-				return fmt.Sprintf("Task %s [%s] accepted and queued to wait for existing tasks.", task.ID, taskSummary), nil
-			}
-			return fmt.Sprintf(
-				"Task %s [%s] accepted and waiting for %s. Reply with 'parallel %s' if you want to force parallel execution.",
-				task.ID,
-				taskSummary,
-				strings.Join(scheduleDecision.DependsOn, ", "),
-				task.ID,
-			), nil
 		}
 
 		return fmt.Sprintf(

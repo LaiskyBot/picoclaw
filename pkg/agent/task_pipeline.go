@@ -59,8 +59,10 @@ type PipelineTask struct {
 // taskPipelineSnapshot is the on-disk format of TaskPipeline.
 // It captures deterministic task ID generation and task states.
 type taskPipelineSnapshot struct {
-	NextID int             `json:"next_id"`
-	Tasks  []*PipelineTask `json:"tasks"`
+	NextID           int             `json:"next_id,omitempty"`
+	NextSequence     int             `json:"next_sequence,omitempty"`
+	LastSequenceDate string          `json:"last_sequence_date,omitempty"`
+	Tasks            []*PipelineTask `json:"tasks"`
 }
 
 // TaskPipeline manages asynchronous background task lifecycle.
@@ -69,7 +71,8 @@ type taskPipelineSnapshot struct {
 type TaskPipeline struct {
 	mu          sync.RWMutex
 	tasks       map[string]*PipelineTask
-	nextID      int
+	nextSequence int
+	lastSeqDate  string
 	queue       chan string
 	storagePath string
 	timeout     time.Duration
@@ -88,7 +91,7 @@ func NewTaskPipeline(workspace string, timeout time.Duration) *TaskPipeline {
 
 	tp := &TaskPipeline{
 		tasks:       map[string]*PipelineTask{},
-		nextID:      1,
+		nextSequence: 1,
 		queue:       make(chan string, 256),
 		storagePath: filepath.Join(stateDir, taskPipelineFileName),
 		timeout:     timeout,
@@ -133,8 +136,9 @@ func (tp *TaskPipeline) EnqueueTaskWithScheduling(
 	normalizedSummary := normalizeTaskSummary(summary)
 
 	tp.mu.Lock()
-	taskID := buildTaskID(time.UnixMilli(nowUTC).UTC(), tp.nextID)
-	tp.nextID++
+	dateKey := time.UnixMilli(nowUTC).UTC().Format(time.DateOnly)
+	sequence := tp.nextSequenceForDateLocked(dateKey)
+	taskID := buildTaskID(time.UnixMilli(nowUTC).UTC(), sequence)
 	task := &PipelineTask{
 		ID:             taskID,
 		Summary:        normalizedSummary,
@@ -291,6 +295,31 @@ func (tp *TaskPipeline) AppendWorkerEvent(taskID, event string) bool {
 
 	if err := tp.saveLocked(); err != nil {
 		logger.WarnCF("agent", "Failed to persist worker event", map[string]any{"task_id": taskID, "error": err.Error()})
+	}
+	return true
+}
+
+// UpdateSummary updates the normalized summary for an existing task.
+// The taskID parameter identifies the task and summary provides new label text.
+// It returns true when the task exists and summary value changes.
+func (tp *TaskPipeline) UpdateSummary(taskID, summary string) bool {
+	normalizedSummary := normalizeTaskSummary(summary)
+
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+
+	task, ok := tp.tasks[taskID]
+	if !ok {
+		return false
+	}
+	if task.Summary == normalizedSummary {
+		return false
+	}
+	task.Summary = normalizedSummary
+	task.UpdatedAtUTC = time.Now().UTC().UnixMilli()
+
+	if err := tp.saveLocked(); err != nil {
+		logger.WarnCF("agent", "Failed to persist task summary update", map[string]any{"task_id": taskID, "error": err.Error()})
 	}
 	return true
 }
@@ -635,14 +664,30 @@ func normalizeTaskSummary(summary string) string {
 	return normalized
 }
 
-// buildTaskID returns a stable task ID composed of UTC timestamp and sequence.
-// The nowUTC parameter is the current UTC time and sequence is a process-local increment.
-// It returns an identifier in format task-YYYYMMDDTHHMMSSZ-NNNN.
+// buildTaskID returns a stable task ID composed of UTC date and sequence.
+// The nowUTC parameter provides the UTC date and sequence is a per-day increment.
+// It returns an identifier in format task-YYYY-MM-DD-NNNN.
 func buildTaskID(nowUTC time.Time, sequence int) string {
-	if sequence < 0 {
-		sequence = 0
+	if sequence <= 0 {
+		sequence = 1
 	}
-	return fmt.Sprintf("task-%s-%04d", nowUTC.UTC().Format("20060102T150405Z"), sequence)
+	return fmt.Sprintf("task-%s-%04d", nowUTC.UTC().Format(time.DateOnly), sequence)
+}
+
+// nextSequenceForDateLocked returns the next sequence number for the provided UTC date.
+// The dateKey parameter must use RFC3339 full-date format YYYY-MM-DD.
+// It returns a positive sequence that resets when the date changes.
+func (tp *TaskPipeline) nextSequenceForDateLocked(dateKey string) int {
+	if tp.lastSeqDate != dateKey {
+		tp.lastSeqDate = dateKey
+		tp.nextSequence = 1
+	}
+	if tp.nextSequence <= 0 {
+		tp.nextSequence = 1
+	}
+	seq := tp.nextSequence
+	tp.nextSequence++
+	return seq
 }
 
 // uniqueTaskIDs removes duplicates and empty values while preserving order.
@@ -726,8 +771,16 @@ func (tp *TaskPipeline) load() {
 		return
 	}
 
-	if snapshot.NextID > 0 {
-		tp.nextID = snapshot.NextID
+	if snapshot.LastSequenceDate != "" {
+		tp.lastSeqDate = snapshot.LastSequenceDate
+	}
+	if snapshot.NextSequence > 0 {
+		tp.nextSequence = snapshot.NextSequence
+	} else if snapshot.NextID > 0 {
+		tp.nextSequence = snapshot.NextID
+	}
+	if tp.nextSequence <= 0 {
+		tp.nextSequence = 1
 	}
 	for _, task := range snapshot.Tasks {
 		if task == nil || task.ID == "" {
@@ -748,8 +801,10 @@ func (tp *TaskPipeline) saveLocked() error {
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].CreatedAtUTC < tasks[j].CreatedAtUTC })
 
 	snapshot := taskPipelineSnapshot{
-		NextID: tp.nextID,
-		Tasks:  tasks,
+		NextID:           tp.nextSequence,
+		NextSequence:     tp.nextSequence,
+		LastSequenceDate: tp.lastSeqDate,
+		Tasks:            tasks,
 	}
 
 	data, err := json.MarshalIndent(snapshot, "", "  ")

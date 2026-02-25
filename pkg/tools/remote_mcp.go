@@ -48,6 +48,14 @@ type remoteMCPServer struct {
 	Headers map[string]string `json:"headers,omitempty"`
 }
 
+// ConfiguredRemoteMCPServer represents one remote MCP server defined from static configuration.
+type ConfiguredRemoteMCPServer struct {
+	Name    string
+	Type    string
+	URL     string
+	Headers map[string]string
+}
+
 // remoteMCPRequest represents a JSON-RPC request to an MCP endpoint.
 type remoteMCPRequest struct {
 	JSONRPC string `json:"jsonrpc"`
@@ -131,8 +139,8 @@ func (t *RemoteMCPTool) Parameters() map[string]any {
 				"description": "Remote tool name for call_tool",
 			},
 			"arguments": map[string]any{
-				"type":        "object",
-				"description": "Arguments object for call_tool",
+				"type":                 "object",
+				"description":          "Arguments object for call_tool",
 				"additionalProperties": true,
 			},
 		},
@@ -562,6 +570,80 @@ func (t *RemoteMCPTool) registryPath() string {
 	return filepath.Join(t.workspace, "memory", "mcp_servers.json")
 }
 
+// BootstrapConfiguredServers merges configured remote servers into persisted registry.
+// The servers parameter should contain HTTP remote MCP server definitions from config.
+// It returns an error when validation or persistence fails.
+func (t *RemoteMCPTool) BootstrapConfiguredServers(servers []ConfiguredRemoteMCPServer) error {
+	if len(servers) == 0 {
+		return nil
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	registry, err := t.loadRegistry()
+	if err != nil {
+		return fmt.Errorf("load remote MCP registry: %w", err)
+	}
+
+	changed := false
+	for _, candidate := range servers {
+		name := strings.TrimSpace(candidate.Name)
+		if name == "" {
+			return fmt.Errorf("configured remote MCP server name is required")
+		}
+
+		transport := strings.ToLower(strings.TrimSpace(candidate.Type))
+		if transport == "" {
+			transport = "http"
+		}
+		if transport != "http" {
+			return fmt.Errorf("configured remote MCP server %q type %q is not supported; only \"http\" is supported", name, transport)
+		}
+
+		resolvedURL, err := validateRemoteMCPURL(strings.TrimSpace(candidate.URL))
+		if err != nil {
+			return fmt.Errorf("configured remote MCP server %q has invalid url %q: %w", name, candidate.URL, err)
+		}
+
+		normalizedHeaders := normalizeStringHeaders(candidate.Headers)
+
+		updated := false
+		for i := range registry.Servers {
+			if registry.Servers[i].Name != name {
+				continue
+			}
+			if registry.Servers[i].URL != resolvedURL || !stringMapEqual(registry.Servers[i].Headers, normalizedHeaders) {
+				registry.Servers[i].URL = resolvedURL
+				registry.Servers[i].Headers = normalizedHeaders
+				changed = true
+			}
+			updated = true
+			break
+		}
+		if updated {
+			continue
+		}
+
+		registry.Servers = append(registry.Servers, remoteMCPServer{
+			Name:    name,
+			URL:     resolvedURL,
+			Headers: normalizedHeaders,
+		})
+		changed = true
+	}
+
+	if !changed {
+		return nil
+	}
+
+	if err := t.saveRegistry(registry); err != nil {
+		return fmt.Errorf("save remote MCP registry: %w", err)
+	}
+
+	return nil
+}
+
 // validateRemoteMCPURL validates and normalizes a remote MCP endpoint URL.
 // The raw parameter is a user-provided URL string.
 // It returns a normalized URL or an error.
@@ -598,4 +680,34 @@ func normalizeHeaders(value any) map[string]string {
 	}
 
 	return headers
+}
+
+// normalizeStringHeaders sanitizes string headers by trimming blank keys and values.
+// The headers parameter is a user or config supplied map.
+// It returns a canonicalized header map safe for persistence.
+func normalizeStringHeaders(headers map[string]string) map[string]string {
+	out := map[string]string{}
+	for key, value := range headers {
+		headerName := strings.TrimSpace(key)
+		if headerName == "" {
+			continue
+		}
+		out[headerName] = strings.TrimSpace(value)
+	}
+	return out
+}
+
+// stringMapEqual compares two string maps for exact key/value equality.
+// The a and b parameters are treated as empty maps when nil.
+// It returns true when both maps contain the same entries.
+func stringMapEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, value := range a {
+		if b[key] != value {
+			return false
+		}
+	}
+	return true
 }

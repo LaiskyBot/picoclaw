@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -15,6 +16,13 @@ import (
 const plannerTaskChannel = "planner_task"
 
 const plannerEmptySummaryText = "Planner completed with no textual output."
+
+var sensitiveTaskSummaryPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)https?://`),
+	regexp.MustCompile(`(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b`),
+	regexp.MustCompile(`(?i)\b(sk|xoxb|xapp|ghp|gho|ghu|ghs|eyj)[-_a-z0-9]{8,}\b`),
+	regexp.MustCompile(`\d{6,}`),
+}
 
 // startTaskPipelineRuntime starts background loops for task processing.
 // The ctx parameter controls lifecycle for queue worker and timeout scanner.
@@ -100,6 +108,15 @@ func (al *AgentLoop) executePlannerTask(parentCtx context.Context, task *Pipelin
 		al.taskPipeline.MarkFailed(task.ID, "Planner agent is not configured")
 		al.publishTaskFinalReport(task.ID, "", fmt.Errorf("planner agent is not configured"))
 		return
+	}
+
+	summaryCtx, summaryCancel := context.WithTimeout(parentCtx, 8*time.Second)
+	generatedSummary := al.generateTaskSummary(summaryCtx, task.Request)
+	summaryCancel()
+	if generatedSummary != "" {
+		if al.taskPipeline.UpdateSummary(task.ID, generatedSummary) {
+			task.Summary = generatedSummary
+		}
 	}
 
 	al.taskPipeline.MarkRunning(task.ID, planner.ID)
@@ -270,15 +287,15 @@ func (al *AgentLoop) maybePromoteQueuedTasks() {
 // The ctx parameter controls LLM call lifecycle and request carries original user input.
 // It returns a normalized short summary with fallback when model call fails.
 func (al *AgentLoop) generateTaskSummary(ctx context.Context, request string) string {
-	fallback := fallbackTaskSummary(request)
+	fallback := fallbackTaskSummary()
 	planner := al.getPlannerAgent()
 	if planner == nil || planner.Provider == nil {
 		return fallback
 	}
 
 	resp, err := planner.Provider.Chat(ctx, []providers.Message{
-		{Role: "system", Content: "You generate concise task labels for tracking. Return one short line only."},
-		{Role: "user", Content: "Summarize this task in 6-14 words, preserve user language, no markdown, no quotes:\n" + request},
+		{Role: "system", Content: "You generate concise task labels for tracking. Return one short line only. Never include secrets, tokens, URLs, emails, IDs, or long numbers."},
+		{Role: "user", Content: "Summarize this task in 4-10 words, preserve user language, no markdown, no quotes, keep it generic and descriptive:\n" + request},
 	}, nil, planner.Model, map[string]any{
 		"max_tokens":  80,
 		"temperature": 0,
@@ -288,21 +305,29 @@ func (al *AgentLoop) generateTaskSummary(ctx context.Context, request string) st
 	}
 
 	label := normalizeTaskSummary(resp.Content)
-	if label == "" {
+	if label == "" || containsSensitiveTaskSummaryText(label) {
 		return fallback
 	}
 	return label
 }
 
-// fallbackTaskSummary builds a deterministic short summary from raw request text.
-// The request parameter may contain multiline user content.
-// It returns a compact single-line fallback summary.
-func fallbackTaskSummary(request string) string {
-	normalized := normalizeTaskSummary(request)
-	if normalized == "" {
-		return "task"
+// fallbackTaskSummary returns a stable generic summary when planner label generation fails.
+// It takes no parameters and intentionally avoids user content to reduce leakage risk.
+// It returns a non-empty generic label string.
+func fallbackTaskSummary() string {
+	return "task"
+}
+
+// containsSensitiveTaskSummaryText checks whether a generated label appears to expose sensitive data.
+// The summary parameter is normalized one-line text from model output.
+// It returns true when sensitive-like patterns are detected.
+func containsSensitiveTaskSummaryText(summary string) bool {
+	for _, pattern := range sensitiveTaskSummaryPatterns {
+		if pattern.MatchString(summary) {
+			return true
+		}
 	}
-	return normalized
+	return false
 }
 
 // taskLabel formats task identifier with optional summary.
@@ -481,7 +506,7 @@ func buildPlannerDelegationPrompt(task *PipelineTask) string {
 	}
 	sb.WriteString("Use tools to classify work, break it down, and delegate worker steps when needed.\n")
 	sb.WriteString("For Skills workflows, prefer find_skills then install_skill, then read the installed SKILL.md and execute steps.\n")
-	sb.WriteString("For MCP workflows (especially remote MCP), use remote_mcp to add/list servers, list remote tools, and call the required remote tool.\n")
+	sb.WriteString("For MCP workflows, distinguish local vs remote MCP. Local MCP is configured under tools.mcp.local, and remote MCP is configured/managed under tools.mcp.remote and via remote_mcp operations.\n")
 	sb.WriteString("When spawning workers, include explicit labels so progress is traceable.\n")
 	sb.WriteString("Always produce a final status summary with success/failure and next actions.\n\n")
 	sb.WriteString("User request:\n")

@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestProviderChat_UsesMaxCompletionTokensForGLM(t *testing.T) {
@@ -324,4 +326,35 @@ func TestNormalizeModel_UsesAPIBase(t *testing.T) {
 	if got := normalizeModel("openrouter/auto", "https://openrouter.ai/api/v1"); got != "openrouter/auto" {
 		t.Fatalf("normalizeModel(openrouter) = %q, want %q", got, "openrouter/auto")
 	}
+}
+
+func TestProviderChat_HTTPErrorIncludesURLModelAndRequestID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-request-id", "req-123")
+		w.WriteHeader(522)
+		_, _ = w.Write([]byte("error code: 522"))
+	}))
+	defer server.Close()
+
+	p := NewProvider("key", server.URL, "")
+	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "gpt-4o", nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "API request failed:")
+	require.Contains(t, err.Error(), "Status: 522")
+	require.Contains(t, err.Error(), "URL:    "+server.URL+"/chat/completions")
+	require.Contains(t, err.Error(), "Model:  gpt-4o")
+	require.Contains(t, err.Error(), "Body:   error code: 522")
+	require.Contains(t, err.Error(), "RequestID: req-123")
+}
+
+func TestSanitizedURL_RemovesSensitiveParts(t *testing.T) {
+	u, err := url.Parse("https://user:pass@example.com/v1/chat/completions?api_key=secret#frag")
+	require.NoError(t, err)
+	require.Equal(t, "https://example.com/v1/chat/completions", sanitizedURL(u))
+}
+
+func TestSummarizeBody_SingleLineAndTruncate(t *testing.T) {
+	body := []byte("line1\nline2\r\nline3")
+	require.Equal(t, "line1\\nline2\\nline3", summarizeBody(body, 100))
+	require.Equal(t, "line1...(truncated)", summarizeBody(body, 5))
 }

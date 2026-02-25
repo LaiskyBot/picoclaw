@@ -425,3 +425,64 @@ func TestLoadConfig_WebToolsProxy(t *testing.T) {
 		t.Fatalf("Tools.Web.Proxy = %q, want %q", cfg.Tools.Web.Proxy, "http://127.0.0.1:7890")
 	}
 }
+
+func TestLoadConfig_MCPConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.json")
+	configJSON := `{
+  "agents": {"defaults":{"workspace":"./workspace","model":"gpt4","max_tokens":8192,"max_tool_iterations":20}},
+  "model_list": [{"model_name":"gpt4","model":"openai/gpt-5.2","api_key":"x"}],
+  "tools": {
+    "mcp": {
+      "local": {
+        "filesystem": {
+          "type": "stdio",
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+          "env": {"NODE_ENV": "production"}
+        }
+      },
+      "remote": {
+        "laisky": {
+          "type": "http",
+          "url": "https://mcp.laisky.com",
+          "headers": {"Authorization": "Bearer test-key"}
+        }
+      }
+    }
+  }
+}`
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+		t.Fatalf("os.WriteFile() error: %v", err)
+	}
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig() error: %v", err)
+	}
+
+	local, ok := cfg.Tools.MCP.Local["filesystem"]
+	if !ok {
+		t.Fatal("missing local MCP server 'filesystem'")
+	}
+	if local.Type != "stdio" {
+		t.Fatalf("local MCP type = %q, want %q", local.Type, "stdio")
+	}
+	if local.Command != "npx" {
+		t.Fatalf("local MCP command = %q, want %q", local.Command, "npx")
+	}
+
+	remote, ok := cfg.Tools.MCP.Remote["laisky"]
+	if !ok {
+		t.Fatal("missing remote MCP server 'laisky'")
+	}
+	if remote.Type != "http" {
+		t.Fatalf("remote MCP type = %q, want %q", remote.Type, "http")
+	}
+	if remote.URL != "https://mcp.laisky.com" {
+		t.Fatalf("remote MCP url = %q, want %q", remote.URL, "https://mcp.laisky.com")
+	}
+	if remote.Headers["Authorization"] != "Bearer test-key" {
+		t.Fatalf("remote MCP auth header = %q, want %q", remote.Headers["Authorization"], "Bearer test-key")
+	}
+}

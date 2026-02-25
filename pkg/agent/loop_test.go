@@ -2,9 +2,12 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,7 +15,73 @@ import (
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/providers"
 	"github.com/sipeed/picoclaw/pkg/tools"
+	"github.com/stretchr/testify/require"
 )
+
+// TestBuildConfiguredRemoteMCPServers verifies config remote MCP entries are converted in sorted order.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestBuildConfiguredRemoteMCPServers(t *testing.T) {
+	servers := buildConfiguredRemoteMCPServers(map[string]config.RemoteMCPServerConfig{
+		"zeta": {
+			Type: "http",
+			URL:  "https://zeta.example.com/mcp",
+		},
+		"alpha": {
+			Type: "http",
+			URL:  "https://alpha.example.com/mcp",
+			Headers: map[string]string{
+				"Authorization": "Bearer token",
+			},
+		},
+	})
+
+	require.Len(t, servers, 2)
+	require.Equal(t, "alpha", servers[0].Name)
+	require.Equal(t, "zeta", servers[1].Name)
+	require.Equal(t, "https://alpha.example.com/mcp", servers[0].URL)
+	require.Equal(t, "Bearer token", servers[0].Headers["Authorization"])
+}
+
+// TestNewAgentLoop_BootstrapsConfiguredRemoteMCPServers verifies remote MCP config is persisted to workspace registry.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestNewAgentLoop_BootstrapsConfiguredRemoteMCPServers(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = tmpDir
+	cfg.Agents.Defaults.Model = "test-model"
+	cfg.Tools.MCP.Remote = map[string]config.RemoteMCPServerConfig{
+		"laisky": {
+			Type: "http",
+			URL:  "https://mcp.laisky.com",
+			Headers: map[string]string{
+				"Authorization": "Bearer test-token",
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &mockProvider{}
+	_ = NewAgentLoop(cfg, msgBus, provider)
+
+	registryPath := filepath.Join(tmpDir, "memory", "mcp_servers.json")
+	data, err := os.ReadFile(registryPath)
+	require.NoError(t, err)
+
+	var payload struct {
+		Servers []struct {
+			Name    string            `json:"name"`
+			URL     string            `json:"url"`
+			Headers map[string]string `json:"headers"`
+		} `json:"servers"`
+	}
+	require.NoError(t, json.Unmarshal(data, &payload))
+	require.Len(t, payload.Servers, 1)
+	require.Equal(t, "laisky", payload.Servers[0].Name)
+	require.Equal(t, "https://mcp.laisky.com", payload.Servers[0].URL)
+	require.Equal(t, "Bearer test-token", payload.Servers[0].Headers["Authorization"])
+}
 
 func TestRecordLastChannel(t *testing.T) {
 	// Create temp workspace
@@ -629,5 +698,89 @@ func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 	// Without compression: 6 + 1 (new user msg) + 1 (assistant msg) = 8
 	if len(finalHistory) >= 8 {
 		t.Errorf("Expected history to be compressed (len < 8), got %d", len(finalHistory))
+	}
+}
+
+// blockingMockProvider blocks Chat calls to detect unwanted foreground LLM usage.
+// The wait parameter defines simulated delay and callCount records invocation count.
+// It returns a static response after waiting unless context is canceled.
+type blockingMockProvider struct {
+	wait      time.Duration
+	callCount atomic.Int32
+}
+
+// Chat blocks for a fixed duration to emulate a slow upstream model call.
+// The ctx parameter may cancel waiting and remaining parameters are ignored in this mock.
+// It returns either context error or a static mock response.
+func (m *blockingMockProvider) Chat(
+	ctx context.Context,
+	_ []providers.Message,
+	_ []providers.ToolDefinition,
+	_ string,
+	_ map[string]any,
+) (*providers.LLMResponse, error) {
+	m.callCount.Add(1)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(m.wait):
+		return &providers.LLMResponse{Content: "blocked-call-finished"}, nil
+	}
+}
+
+// GetDefaultModel returns a static model identifier for tests.
+// It accepts no parameters and returns mock model name.
+func (m *blockingMockProvider) GetDefaultModel() string {
+	return "blocking-mock-model"
+}
+
+// Calls returns number of Chat invocations observed by this provider.
+// It accepts no parameters and returns call counter value.
+func (m *blockingMockProvider) Calls() int32 {
+	return m.callCount.Load()
+}
+
+// TestProcessMessage_ExternalChannelsDelegateWithoutForegroundLLM verifies chat channels enqueue directly to planner pipeline.
+// The test parameter exercises multiple external channels.
+// It returns no value and fails when delegation blocks on provider Chat.
+func TestProcessMessage_ExternalChannelsDelegateWithoutForegroundLLM(t *testing.T) {
+	t.Parallel()
+
+	channels := []string{"telegram", "slack", "discord"}
+	for _, channelName := range channels {
+		t.Run(channelName, func(t *testing.T) {
+			tmpDir, err := os.MkdirTemp("", "agent-delegate-fast-*")
+			require.NoError(t, err)
+			defer os.RemoveAll(tmpDir)
+
+			cfg := &config.Config{
+				Agents: config.AgentsConfig{
+					Defaults: config.AgentDefaults{
+						Workspace:         tmpDir,
+						Model:             "test-model",
+						MaxTokens:         4096,
+						MaxToolIterations: 10,
+					},
+				},
+			}
+
+			msgBus := bus.NewMessageBus()
+			provider := &blockingMockProvider{wait: 2 * time.Second}
+			al := NewAgentLoop(cfg, msgBus, provider)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+
+			response, runErr := al.processMessage(ctx, bus.InboundMessage{
+				Channel:  channelName,
+				SenderID: "user-1",
+				ChatID:   "chat-1",
+				Content:  "Please investigate this issue thoroughly and execute a full solution plan.",
+			})
+			require.NoError(t, runErr)
+			require.Contains(t, response, "accepted. I have delegated it to the planner")
+			require.Zero(t, provider.Calls(), "chat dispatch path must not call provider directly")
+			require.True(t, strings.Contains(strings.ToLower(response), "task "))
+		})
 	}
 }

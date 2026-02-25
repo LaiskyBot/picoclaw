@@ -293,6 +293,10 @@ func DefaultConfig() *Config {
 					MaxResults: 5,
 				},
 			},
+			MCP: MCPToolsConfig{
+				Local:  map[string]LocalMCPServerConfig{},
+				Remote: map[string]RemoteMCPServerConfig{},
+			},
 			Cron: CronToolsConfig{
 				ExecTimeoutMinutes: 5,
 			},

@@ -12,6 +12,49 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestRemoteMCPToolBootstrapConfiguredServers verifies config-driven remote servers are persisted.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestRemoteMCPToolBootstrapConfiguredServers(t *testing.T) {
+	workspace := t.TempDir()
+	tool := NewRemoteMCPTool(workspace)
+
+	err := tool.BootstrapConfiguredServers([]ConfiguredRemoteMCPServer{
+		{
+			Name: "laisky",
+			Type: "http",
+			URL:  "https://mcp.laisky.com",
+			Headers: map[string]string{
+				"Authorization": "Bearer abc",
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	listResult := tool.Execute(context.Background(), map[string]any{
+		"operation": "list_servers",
+	})
+	require.False(t, listResult.IsError)
+	require.Contains(t, listResult.ForUser, "laisky")
+	require.Contains(t, listResult.ForUser, "https://mcp.laisky.com")
+}
+
+// TestRemoteMCPToolBootstrapConfiguredServersRejectsUnsupportedType verifies only HTTP transport is accepted.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestRemoteMCPToolBootstrapConfiguredServersRejectsUnsupportedType(t *testing.T) {
+	tool := NewRemoteMCPTool(t.TempDir())
+	err := tool.BootstrapConfiguredServers([]ConfiguredRemoteMCPServer{
+		{
+			Name: "bad",
+			Type: "stdio",
+			URL:  "https://example.com/mcp",
+		},
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "only \"http\" is supported")
+}
+
 // TestRemoteMCPToolRegistryLifecycle verifies add/list/remove server operations persist correctly.
 // The t parameter controls test lifecycle.
 // It returns no value and fails the test on assertion errors.
