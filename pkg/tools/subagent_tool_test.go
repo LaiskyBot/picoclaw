@@ -11,7 +11,8 @@ import (
 
 // MockLLMProvider is a test implementation of LLMProvider
 type MockLLMProvider struct {
-	lastOptions map[string]any
+	lastOptions  map[string]any
+	lastMessages []providers.Message
 }
 
 func (m *MockLLMProvider) Chat(
@@ -22,6 +23,7 @@ func (m *MockLLMProvider) Chat(
 	options map[string]any,
 ) (*providers.LLMResponse, error) {
 	m.lastOptions = options
+	m.lastMessages = append([]providers.Message(nil), messages...)
 	// Find the last user message to generate a response
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
@@ -31,6 +33,35 @@ func (m *MockLLMProvider) Chat(
 		}
 	}
 	return &providers.LLMResponse{Content: "No task provided"}, nil
+}
+
+// TestSubagentTool_Execute_IncludesTaskReference verifies delegation context is embedded in worker prompts.
+// It sets a task reference and checks the generated user message includes that context.
+// It returns no value and fails test on missing prompt fragments.
+func TestSubagentTool_Execute_IncludesTaskReference(t *testing.T) {
+	provider := &MockLLMProvider{}
+	manager := NewSubagentManager(provider, "test-model", "/tmp/test", nil)
+	tool := NewSubagentTool(manager)
+	tool.SetTaskReference("Conversation summary: user needs a rollback plan")
+
+	result := tool.Execute(context.Background(), map[string]any{"task": "Prepare deployment rollback steps"})
+	if result == nil || result.IsError {
+		t.Fatalf("Expected successful result, got: %+v", result)
+	}
+
+	if len(provider.lastMessages) < 2 {
+		t.Fatalf("Expected at least two messages, got %d", len(provider.lastMessages))
+	}
+	userPrompt := provider.lastMessages[len(provider.lastMessages)-1].Content
+	if !strings.Contains(userPrompt, "Primary task:") {
+		t.Fatalf("Expected worker prompt to contain primary task marker, got: %s", userPrompt)
+	}
+	if !strings.Contains(userPrompt, "Reference context from planner") {
+		t.Fatalf("Expected worker prompt to contain reference marker, got: %s", userPrompt)
+	}
+	if !strings.Contains(userPrompt, "rollback plan") {
+		t.Fatalf("Expected worker prompt to include task reference content, got: %s", userPrompt)
+	}
 }
 
 func (m *MockLLMProvider) GetDefaultModel() string {

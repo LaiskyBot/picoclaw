@@ -257,6 +257,7 @@ func (al *AgentLoop) resumeSubagentTasks(ctx context.Context) {
 		if !ok {
 			continue
 		}
+		spawnTool.SetRuntimeContext(ctx)
 		resumedTotal += spawnTool.ResumeUnfinished(ctx)
 	}
 
@@ -411,6 +412,23 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			return "Failed to enqueue your task for background planning. Please retry.", nil
 		}
 
+		route := al.registry.ResolveRoute(routing.RouteInput{
+			Channel:    msg.Channel,
+			AccountID:  msg.Metadata["account_id"],
+			Peer:       extractPeer(msg),
+			ParentPeer: extractParentPeer(msg),
+			GuildID:    msg.Metadata["guild_id"],
+			TeamID:     msg.Metadata["team_id"],
+		})
+		if routeAgent, ok := al.registry.GetAgent(route.AgentID); ok {
+			history := routeAgent.Sessions.GetHistory(route.SessionKey)
+			conversationSummary := routeAgent.Sessions.GetSummary(route.SessionKey)
+			delegationContext := buildDelegationReference(routeAgent, history, conversationSummary)
+			if delegationContext != "" {
+				_ = al.taskPipeline.SetDelegationContext(task.ID, delegationContext)
+			}
+		}
+
 		return fmt.Sprintf(
 			"Task %s accepted. I have delegated it to the planner and will keep you updated. Send /status anytime for progress.",
 			taskLabel(task),
@@ -557,16 +575,20 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 		}
 	}
 
-	// 1. Update tool contexts
-	al.updateToolContexts(agent, opts.Channel, opts.ChatID)
-
-	// 2. Build messages (skip history for heartbeat)
+	// 1. Build messages (skip history for heartbeat)
 	var history []providers.Message
 	var summary string
 	if !opts.NoHistory {
 		history = agent.Sessions.GetHistory(opts.SessionKey)
 		summary = agent.Sessions.GetSummary(opts.SessionKey)
 	}
+
+	delegationReference := buildDelegationReference(agent, history, summary)
+
+	// 2. Update tool contexts
+	al.updateToolContexts(agent, opts.Channel, opts.ChatID, delegationReference)
+
+	// 3. Build messages
 	messages := agent.ContextBuilder.BuildMessages(
 		history,
 		summary,
@@ -576,10 +598,10 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 		opts.ChatID,
 	)
 
-	// 3. Save user message to session
+	// 4. Save user message to session
 	agent.Sessions.AddMessage(opts.SessionKey, "user", opts.UserMessage)
 
-	// 4. Run LLM iteration loop
+	// 5. Run LLM iteration loop
 	finalContent, iteration, err := al.runLLMIteration(ctx, agent, messages, opts)
 	if err != nil {
 		return "", err
@@ -588,21 +610,21 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	// If last tool had ForUser content and we already sent it, we might not need to send final response
 	// This is controlled by the tool's Silent flag and ForUser content
 
-	// 5. Handle empty response
+	// 6. Handle empty response
 	if finalContent == "" {
 		finalContent = opts.DefaultResponse
 	}
 
-	// 6. Save final assistant message to session
+	// 7. Save final assistant message to session
 	agent.Sessions.AddMessage(opts.SessionKey, "assistant", finalContent)
 	agent.Sessions.Save(opts.SessionKey)
 
-	// 7. Optional: summarization
+	// 8. Optional: summarization
 	if opts.EnableSummary {
 		al.maybeSummarize(agent, opts.SessionKey, opts.Channel, opts.ChatID)
 	}
 
-	// 8. Optional: send response via bus
+	// 9. Optional: send response via bus
 	if opts.SendResponse {
 		al.bus.PublishOutbound(bus.OutboundMessage{
 			Channel: opts.Channel,
@@ -611,7 +633,7 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 		})
 	}
 
-	// 9. Log response
+	// 10. Log response
 	responsePreview := utils.Truncate(finalContent, 120)
 	logger.InfoCF("agent", fmt.Sprintf("Response: %s", responsePreview),
 		map[string]any{
@@ -884,8 +906,10 @@ func (al *AgentLoop) runLLMIteration(
 	return finalContent, iteration, nil
 }
 
-// updateToolContexts updates the context for tools that need channel/chatID info.
-func (al *AgentLoop) updateToolContexts(agent *AgentInstance, channel, chatID string) {
+// updateToolContexts updates context for tools that need channel/chatID and task references.
+// The agent parameter contains tool registry, channel/chatID define chat scope, and taskReference carries memory/history references.
+// It returns no value.
+func (al *AgentLoop) updateToolContexts(agent *AgentInstance, channel, chatID, taskReference string) {
 	// Use ContextualTool interface instead of type assertions
 	if tool, ok := agent.Tools.Get("message"); ok {
 		if mt, ok := tool.(tools.ContextualTool); ok {
@@ -896,12 +920,86 @@ func (al *AgentLoop) updateToolContexts(agent *AgentInstance, channel, chatID st
 		if st, ok := tool.(tools.ContextualTool); ok {
 			st.SetContext(channel, chatID)
 		}
+		if rt, ok := tool.(tools.TaskReferenceTool); ok {
+			rt.SetTaskReference(taskReference)
+		}
 	}
 	if tool, ok := agent.Tools.Get("subagent"); ok {
 		if st, ok := tool.(tools.ContextualTool); ok {
 			st.SetContext(channel, chatID)
 		}
+		if rt, ok := tool.(tools.TaskReferenceTool); ok {
+			rt.SetTaskReference(taskReference)
+		}
 	}
+}
+
+// buildDelegationReference composes memory and recent conversation history for delegated tasks.
+// The agent parameter provides memory access while history and summary capture recent interaction state.
+// It returns a compact plain-text reference payload for planner/worker tools.
+func buildDelegationReference(agent *AgentInstance, history []providers.Message, summary string) string {
+	if agent == nil {
+		return ""
+	}
+
+	trimmedSummary := strings.TrimSpace(summary)
+	memoryContext := ""
+	if agent.ContextBuilder != nil && agent.ContextBuilder.memory != nil {
+		memoryContext = strings.TrimSpace(agent.ContextBuilder.memory.GetMemoryContext())
+	}
+	recent := formatRecentConversationHistory(history, 8)
+
+	if trimmedSummary == "" && memoryContext == "" && recent == "" {
+		return ""
+	}
+
+	var sb strings.Builder
+	if trimmedSummary != "" {
+		sb.WriteString("Conversation summary:\n")
+		sb.WriteString(utils.Truncate(trimmedSummary, 1200))
+		sb.WriteString("\n\n")
+	}
+	if recent != "" {
+		sb.WriteString("Recent interaction history:\n")
+		sb.WriteString(recent)
+		sb.WriteString("\n\n")
+	}
+	if memoryContext != "" {
+		sb.WriteString("Memory highlights:\n")
+		sb.WriteString(utils.Truncate(memoryContext, 1200))
+	}
+
+	return strings.TrimSpace(utils.Truncate(sb.String(), 3200))
+}
+
+// formatRecentConversationHistory formats recent user/assistant turns for delegated task references.
+// The history parameter is the session message list and maxMessages limits returned turns.
+// It returns formatted one-line entries in chronological order.
+func formatRecentConversationHistory(history []providers.Message, maxMessages int) string {
+	if len(history) == 0 || maxMessages <= 0 {
+		return ""
+	}
+
+	turns := make([]string, 0, maxMessages)
+	for i := len(history) - 1; i >= 0 && len(turns) < maxMessages; i-- {
+		msg := history[i]
+		if msg.Role != "user" && msg.Role != "assistant" {
+			continue
+		}
+		content := strings.TrimSpace(msg.Content)
+		if content == "" {
+			continue
+		}
+		turns = append(turns, fmt.Sprintf("- %s: %s", msg.Role, utils.Truncate(content, 260)))
+	}
+	if len(turns) == 0 {
+		return ""
+	}
+
+	for i, j := 0, len(turns)-1; i < j; i, j = i+1, j-1 {
+		turns[i], turns[j] = turns[j], turns[i]
+	}
+	return strings.Join(turns, "\n")
 }
 
 // maybeSummarize triggers summarization if the session history exceeds thresholds.

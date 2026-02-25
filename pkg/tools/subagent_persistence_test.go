@@ -20,7 +20,7 @@ func TestSubagentManager_PersistsTasksAcrossRestart(t *testing.T) {
 	provider := &MockLLMProvider{}
 	manager := NewSubagentManager(provider, "test-model", tmpDir, nil)
 
-	_, err = manager.Spawn(context.Background(), "collect diagnostics", "diag", "", "cli", "direct", nil)
+	_, err = manager.Spawn(context.Background(), "collect diagnostics", "diag", "", "", "cli", "direct", nil)
 	require.NoError(t, err)
 
 	task := waitForAnySubagentTask(t, manager, 2*time.Second)
@@ -66,6 +66,57 @@ func TestSubagentManager_ResumeUnfinished(t *testing.T) {
 	require.Equal(t, 1, resumed)
 
 	waitForSubagentStatus(t, reloaded, "subagent-9", SubagentStatusCompleted, 2*time.Second)
+}
+
+// TestSubagentManager_Spawn_DetachesFromCallContext verifies async workers do not inherit
+// short-lived per-call cancellation contexts.
+// It spawns with an already-canceled call context and expects task completion.
+// It returns no value and fails if the task is canceled due to call context.
+func TestSubagentManager_Spawn_DetachesFromCallContext(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "subagent-detach-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	provider := &MockLLMProvider{}
+	manager := NewSubagentManager(provider, "test-model", tmpDir, nil)
+
+	callCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	taskID, err := manager.Spawn(callCtx, "finish despite canceled caller", "detach", "", "", "cli", "direct", nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, taskID)
+
+	task := waitForAnySubagentTask(t, manager, 2*time.Second)
+	require.NotNil(t, task)
+	require.Equal(t, SubagentStatusCompleted, task.Status)
+	require.Contains(t, task.Result, "Task completed")
+}
+
+// TestSubagentManager_Spawn_UsesRuntimeContextCancellation verifies manager runtime context
+// remains the authoritative lifecycle control for async workers.
+// It cancels runtime context before spawn and expects task cancellation.
+// It returns no value and fails if task still runs.
+func TestSubagentManager_Spawn_UsesRuntimeContextCancellation(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "subagent-runtime-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	provider := &MockLLMProvider{}
+	manager := NewSubagentManager(provider, "test-model", tmpDir, nil)
+
+	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
+	manager.SetRuntimeContext(runtimeCtx)
+	runtimeCancel()
+
+	taskID, err := manager.Spawn(context.Background(), "should cancel by runtime context", "runtime-cancel", "", "", "cli", "direct", nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, taskID)
+
+	task := waitForAnySubagentTask(t, manager, 2*time.Second)
+	require.NotNil(t, task)
+	require.Equal(t, SubagentStatusCanceled, task.Status)
+	require.Contains(t, task.Result, "Task canceled")
 }
 
 // waitForAnySubagentTask waits until at least one task exists and is terminal.

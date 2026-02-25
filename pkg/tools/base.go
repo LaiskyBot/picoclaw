@@ -17,6 +17,15 @@ type ContextualTool interface {
 	SetContext(channel, chatID string)
 }
 
+// TaskReferenceTool is an optional interface that tools can implement
+// to receive delegation context (memory and recent interaction history).
+// The taskReference parameter contains a plain-text reference payload.
+// It returns no value.
+type TaskReferenceTool interface {
+	Tool
+	SetTaskReference(taskReference string)
+}
+
 // AsyncCallback is a function type that async tools use to notify completion.
 // When an async tool finishes its work, it calls this callback with the result.
 //

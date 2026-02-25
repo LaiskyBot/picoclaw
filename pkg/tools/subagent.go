@@ -7,10 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
+	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/providers"
 )
 
@@ -29,6 +31,7 @@ type SubagentTask struct {
 	Task             string `json:"task"`
 	Label            string `json:"label,omitempty"`
 	AgentID          string `json:"agent_id,omitempty"`
+	TaskReference    string `json:"task_reference,omitempty"`
 	OriginChannel    string `json:"origin_channel"`
 	OriginChatID     string `json:"origin_chat_id"`
 	Status           string `json:"status"`
@@ -47,6 +50,7 @@ type subagentSnapshot struct {
 type SubagentManager struct {
 	tasks          map[string]*SubagentTask
 	mu             sync.RWMutex
+	runtimeCtx     context.Context
 	provider       providers.LLMProvider
 	defaultModel   string
 	bus            *bus.MessageBus
@@ -57,6 +61,7 @@ type SubagentManager struct {
 	temperature    float64
 	hasMaxTokens   bool
 	hasTemperature bool
+	taskReference  string
 	nextID         int
 	storagePath    string
 }
@@ -71,6 +76,7 @@ func NewSubagentManager(
 
 	sm := &SubagentManager{
 		tasks:         make(map[string]*SubagentTask),
+		runtimeCtx:    context.Background(),
 		provider:      provider,
 		defaultModel:  defaultModel,
 		bus:           bus,
@@ -82,6 +88,35 @@ func NewSubagentManager(
 	}
 	sm.loadLocked()
 	return sm
+}
+
+// SetRuntimeContext sets the long-lived lifecycle context used by async subagent workers.
+// The runtimeCtx parameter should outlive individual tool-call contexts and usually maps to
+// process runtime context in gateway mode.
+// It returns no value.
+func (sm *SubagentManager) SetRuntimeContext(runtimeCtx context.Context) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if runtimeCtx == nil {
+		runtimeCtx = context.Background()
+	}
+	sm.runtimeCtx = runtimeCtx
+}
+
+// getExecutionContext resolves the context used for background subagent execution.
+// The callCtx parameter is the per-tool-invocation context and may be short-lived.
+// It returns the manager runtime context when configured, otherwise a safe background context.
+func (sm *SubagentManager) getExecutionContext(callCtx context.Context) context.Context {
+	sm.mu.RLock()
+	runtimeCtx := sm.runtimeCtx
+	sm.mu.RUnlock()
+	if runtimeCtx != nil {
+		return runtimeCtx
+	}
+	if callCtx != nil {
+		return callCtx
+	}
+	return context.Background()
 }
 
 // SetLLMOptions sets max tokens and temperature for subagent LLM calls.
@@ -109,9 +144,18 @@ func (sm *SubagentManager) RegisterTool(tool Tool) {
 	sm.tools.Register(tool)
 }
 
+// SetTaskReference sets delegation context used by synchronous subagent execution.
+// The taskReference parameter should contain memory and recent interaction history.
+// It returns no value.
+func (sm *SubagentManager) SetTaskReference(taskReference string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.taskReference = taskReference
+}
+
 func (sm *SubagentManager) Spawn(
 	ctx context.Context,
-	task, label, agentID, originChannel, originChatID string,
+	task, label, agentID, taskReference, originChannel, originChatID string,
 	callback AsyncCallback,
 ) (string, error) {
 	sm.mu.Lock()
@@ -125,6 +169,7 @@ func (sm *SubagentManager) Spawn(
 		Task:             task,
 		Label:            label,
 		AgentID:          agentID,
+		TaskReference:    taskReference,
 		OriginChannel:    originChannel,
 		OriginChatID:     originChatID,
 		Status:           SubagentStatusQueued,
@@ -140,8 +185,20 @@ func (sm *SubagentManager) Spawn(
 	}
 	sm.mu.Unlock()
 
+	execCtx := sm.getExecutionContext(ctx)
+
+	logger.DebugCF("subagent", "Scheduling subagent background task", map[string]any{
+		"task_id":       taskID,
+		"label":         label,
+		"agent_id":      agentID,
+		"origin_channel": originChannel,
+		"origin_chat_id": originChatID,
+		"task_len":      len(strings.TrimSpace(task)),
+		"ctx_err":       fmt.Sprint(ctx.Err()),
+	})
+
 	// Start task in background with context cancellation support
-	go sm.runTask(ctx, taskID, callback)
+	go sm.runTask(execCtx, taskID, callback)
 
 	if label != "" {
 		return fmt.Sprintf("Spawned subagent '%s' (task_id=%s) for task: %s", label, taskID, task), nil
@@ -202,6 +259,7 @@ func (sm *SubagentManager) runTask(ctx context.Context, taskID string, callback 
 	}
 
 	taskPrompt := task.Task
+	taskReference := task.TaskReference
 	taskLabel := task.Label
 	originChannel := task.OriginChannel
 	originChatID := task.OriginChatID
@@ -219,13 +277,17 @@ After completing the task, provide a clear summary of what was done.`
 		},
 		{
 			Role:    "user",
-			Content: taskPrompt,
+			Content: buildSubagentUserPrompt(taskPrompt, taskReference),
 		},
 	}
 
 	// Check if context is already canceled before starting
 	select {
 	case <-ctx.Done():
+		logger.DebugCF("subagent", "Subagent task canceled before execution", map[string]any{
+			"task_id": taskID,
+			"reason":  ctx.Err().Error(),
+		})
 		sm.mu.Lock()
 		task.Status = SubagentStatusCanceled
 		task.Result = "Task canceled before execution"
@@ -306,6 +368,10 @@ After completing the task, provide a clear summary of what was done.`
 		task.Result = fmt.Sprintf("Error: %v", err)
 		// Check if it was canceled
 		if ctx.Err() != nil {
+			logger.DebugCF("subagent", "Subagent task canceled during execution", map[string]any{
+				"task_id": taskID,
+				"reason":  ctx.Err().Error(),
+			})
 			task.Status = SubagentStatusCanceled
 			task.Result = "Task canceled during execution"
 		}
@@ -511,6 +577,16 @@ func (t *SubagentTool) SetContext(channel, chatID string) {
 	t.originChatID = chatID
 }
 
+// SetTaskReference updates delegation context for synchronous subagent runs.
+// The taskReference parameter includes memory and recent interaction history.
+// It returns no value.
+func (t *SubagentTool) SetTaskReference(taskReference string) {
+	if t.manager == nil {
+		return
+	}
+	t.manager.SetTaskReference(taskReference)
+}
+
 func (t *SubagentTool) Execute(ctx context.Context, args map[string]any) *ToolResult {
 	task, ok := args["task"].(string)
 	if !ok {
@@ -524,20 +600,9 @@ func (t *SubagentTool) Execute(ctx context.Context, args map[string]any) *ToolRe
 	}
 
 	// Build messages for subagent
-	messages := []providers.Message{
-		{
-			Role:    "system",
-			Content: "You are a subagent. Complete the given task independently and provide a clear, concise result.",
-		},
-		{
-			Role:    "user",
-			Content: task,
-		},
-	}
-
-	// Use RunToolLoop to execute with tools (same as async SpawnTool)
 	sm := t.manager
 	sm.mu.RLock()
+	taskReference := sm.taskReference
 	tools := sm.tools
 	maxIter := sm.maxIterations
 	maxTokens := sm.maxTokens
@@ -545,6 +610,19 @@ func (t *SubagentTool) Execute(ctx context.Context, args map[string]any) *ToolRe
 	hasMaxTokens := sm.hasMaxTokens
 	hasTemperature := sm.hasTemperature
 	sm.mu.RUnlock()
+
+	messages := []providers.Message{
+		{
+			Role:    "system",
+			Content: "You are a subagent. Complete the given task independently and provide a clear, concise result.",
+		},
+		{
+			Role:    "user",
+			Content: buildSubagentUserPrompt(task, taskReference),
+		},
+	}
+
+	// Use RunToolLoop to execute with tools (same as async SpawnTool)
 
 	var llmOptions map[string]any
 	if hasMaxTokens || hasTemperature {
@@ -590,4 +668,23 @@ func (t *SubagentTool) Execute(ctx context.Context, args map[string]any) *ToolRe
 		IsError: false,
 		Async:   false,
 	}
+}
+
+// buildSubagentUserPrompt builds a worker task message with optional delegation reference.
+// The task parameter is the primary assignment and taskReference contains memory/history context.
+// It returns a single user prompt string for worker execution.
+func buildSubagentUserPrompt(task, taskReference string) string {
+	reference := strings.TrimSpace(taskReference)
+	if reference == "" {
+		return task
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Primary task:\n")
+	sb.WriteString(task)
+	sb.WriteString("\n\n")
+	sb.WriteString("Reference context from planner (memory and interaction history):\n")
+	sb.WriteString(reference)
+	sb.WriteString("\n\nUse the reference as supporting context. Prioritize explicit task requirements if conflicts appear.")
+	return sb.String()
 }

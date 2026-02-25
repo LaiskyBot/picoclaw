@@ -597,6 +597,11 @@ func buildPlannerDelegationPrompt(task *PipelineTask) string {
 		sb.WriteString(task.Summary)
 		sb.WriteString("\n")
 	}
+	if strings.TrimSpace(task.DelegationContext) != "" {
+		sb.WriteString("Delegation reference (memory and interaction history):\n")
+		sb.WriteString(task.DelegationContext)
+		sb.WriteString("\n")
+	}
 	sb.WriteString("Use tools to classify work, break it down, and delegate worker steps when needed.\n")
 	sb.WriteString("For Skills workflows, prefer find_skills then install_skill, then read the installed SKILL.md and execute steps.\n")
 	sb.WriteString("For MCP workflows, distinguish local vs remote MCP. Local MCP is configured under tools.mcp.local, and remote MCP is configured/managed under tools.mcp.remote and via remote_mcp operations.\n")

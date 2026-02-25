@@ -39,6 +39,7 @@ const (
 type PipelineTask struct {
 	ID             string   `json:"id"`
 	Summary        string   `json:"summary,omitempty"`
+	DelegationContext string `json:"delegation_context,omitempty"`
 	Channel        string   `json:"channel"`
 	ChatID         string   `json:"chat_id"`
 	SenderID       string   `json:"sender_id"`
@@ -234,6 +235,28 @@ func (tp *TaskPipeline) MarkRunning(taskID, plannerAgent string) bool {
 
 	if err := tp.saveLocked(); err != nil {
 		logger.WarnCF("agent", "Failed to persist running task", map[string]any{"task_id": taskID, "error": err.Error()})
+	}
+	return true
+}
+
+// SetDelegationContext updates planner delegation context for a queued/running task.
+// The taskID parameter identifies the task and context carries memory/history references.
+// It returns true when the task is updated.
+func (tp *TaskPipeline) SetDelegationContext(taskID, context string) bool {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+
+	task, ok := tp.tasks[taskID]
+	if !ok {
+		return false
+	}
+	nowUTC := time.Now().UTC().UnixMilli()
+	task.DelegationContext = strings.TrimSpace(context)
+	task.UpdatedAtUTC = nowUTC
+	task.CheckpointAtUTC = nowUTC
+	task.CheckpointNote = "delegation context updated"
+	if err := tp.saveLocked(); err != nil {
+		logger.WarnCF("agent", "Failed to persist delegation context", map[string]any{"task_id": taskID, "error": err.Error()})
 	}
 	return true
 }

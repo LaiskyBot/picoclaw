@@ -44,6 +44,34 @@ func TestBuildConfiguredRemoteMCPServers(t *testing.T) {
 	require.Equal(t, "Bearer token", servers[0].Headers["Authorization"])
 }
 
+// TestBuildDelegationReference_IncludesSummaryHistoryMemory verifies delegated reference payload contains key context blocks.
+// It seeds summary, recent messages, and long-term memory then validates formatted output.
+// It returns no value and fails test on missing sections.
+func TestBuildDelegationReference_IncludesSummaryHistoryMemory(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "delegation-reference-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	cb := NewContextBuilder(tmpDir)
+	require.NoError(t, cb.memory.WriteLongTerm("User prefers concise status updates."))
+
+	agent := &AgentInstance{ContextBuilder: cb}
+	history := []providers.Message{
+		{Role: "system", Content: "ignored"},
+		{Role: "user", Content: "Please summarize deployment risk."},
+		{Role: "assistant", Content: "I will inspect release notes first."},
+		{Role: "tool", Content: "ignored tool output"},
+	}
+
+	ref := buildDelegationReference(agent, history, "Need deployment risk summary for today")
+	require.Contains(t, ref, "Conversation summary:")
+	require.Contains(t, ref, "Recent interaction history:")
+	require.Contains(t, ref, "Memory highlights:")
+	require.Contains(t, ref, "deployment risk")
+	require.Contains(t, ref, "concise status updates")
+	require.NotContains(t, ref, "ignored tool output")
+}
+
 // TestNewAgentLoop_BootstrapsConfiguredRemoteMCPServers verifies remote MCP config is persisted to workspace registry.
 // The t parameter controls test lifecycle.
 // It returns no value and fails the test on assertion errors.

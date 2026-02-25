@@ -10,6 +10,7 @@ type SpawnTool struct {
 	manager        *SubagentManager
 	originChannel  string
 	originChatID   string
+	taskReference  string
 	allowlistCheck func(targetAgentID string) bool
 	callback       AsyncCallback // For async completion notification
 }
@@ -61,6 +62,24 @@ func (t *SpawnTool) SetContext(channel, chatID string) {
 	t.originChatID = chatID
 }
 
+// SetTaskReference stores delegation context for the next spawned worker task.
+// The taskReference parameter should include relevant memory and recent history.
+// It returns no value.
+func (t *SpawnTool) SetTaskReference(taskReference string) {
+	t.taskReference = taskReference
+}
+
+// SetRuntimeContext sets the lifecycle context used by spawned background tasks.
+// The runtimeCtx parameter should usually be the process/runtime context instead of
+// a per-request context.
+// It returns no value.
+func (t *SpawnTool) SetRuntimeContext(runtimeCtx context.Context) {
+	if t.manager == nil {
+		return
+	}
+	t.manager.SetRuntimeContext(runtimeCtx)
+}
+
 func (t *SpawnTool) SetAllowlistChecker(check func(targetAgentID string) bool) {
 	t.allowlistCheck = check
 }
@@ -96,7 +115,7 @@ func (t *SpawnTool) Execute(ctx context.Context, args map[string]any) *ToolResul
 	}
 
 	// Pass callback to manager for async completion notification
-	result, err := t.manager.Spawn(ctx, task, label, agentID, t.originChannel, t.originChatID, t.callback)
+	result, err := t.manager.Spawn(ctx, task, label, agentID, t.taskReference, t.originChannel, t.originChatID, t.callback)
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("failed to spawn subagent: %v", err))
 	}
