@@ -347,6 +347,22 @@ func TestProviderChat_HTTPErrorIncludesURLModelAndRequestID(t *testing.T) {
 	require.Contains(t, err.Error(), "RequestID: req-123")
 }
 
+func TestProviderChat_HTTPErrorIncludesStructuredEndpointError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("request-id", "req-structured-456")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":{"message":"upstream model overloaded","type":"server_error","code":"bad_gateway","param":"model"}}`))
+	}))
+	defer server.Close()
+
+	p := NewProvider("key", server.URL, "")
+	_, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "gpt-4o", nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Status: 502")
+	require.Contains(t, err.Error(), "EndpointError: message=\"upstream model overloaded\", type=server_error, code=bad_gateway, param=model")
+	require.Contains(t, err.Error(), "RequestID: req-structured-456")
+}
+
 func TestSanitizedURL_RemovesSensitiveParts(t *testing.T) {
 	u, err := url.Parse("https://user:pass@example.com/v1/chat/completions?api_key=secret#frag")
 	require.NoError(t, err)
@@ -357,4 +373,18 @@ func TestSummarizeBody_SingleLineAndTruncate(t *testing.T) {
 	body := []byte("line1\nline2\r\nline3")
 	require.Equal(t, "line1\\nline2\\nline3", summarizeBody(body, 100))
 	require.Equal(t, "line1...(truncated)", summarizeBody(body, 5))
+}
+
+func TestSummarizeEndpointError_ParsesCommonErrorFields(t *testing.T) {
+	body := []byte(`{"error":{"message":"quota exceeded","type":"invalid_request_error","code":429,"param":"messages[0]"},"request_id":"abc-1"}`)
+	summary := summarizeEndpointError(body, 500)
+	require.Contains(t, summary, `message="quota exceeded"`)
+	require.Contains(t, summary, "type=invalid_request_error")
+	require.Contains(t, summary, "code=429")
+	require.Contains(t, summary, "param=messages[0]")
+	require.Contains(t, summary, "request_id=abc-1")
+}
+
+func TestSummarizeEndpointError_NonJSONReturnsEmpty(t *testing.T) {
+	require.Equal(t, "", summarizeEndpointError([]byte("error code: 502"), 300))
 }

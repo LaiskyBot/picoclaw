@@ -170,6 +170,7 @@ func (p *Provider) Chat(
 			resp.Header.Get("cf-ray"),
 		)
 		bodyPreview := summarizeBody(body, 2000)
+		endpointError := summarizeEndpointError(body, 500)
 
 		logger.DebugCF("openai_compat", "Chat completion non-200 response", map[string]any{
 			"url":            requestURL,
@@ -180,9 +181,13 @@ func (p *Provider) Chat(
 			"request_id":     requestID,
 			"server":         resp.Header.Get("server"),
 			"body_preview":   summarizeBody(body, 300),
+			"endpoint_error": endpointError,
 		})
 
 		errorText := fmt.Sprintf("API request failed:\n  Status: %d\n  URL:    %s\n  Model:  %s\n  Body:   %s", resp.StatusCode, requestURL, model, bodyPreview)
+		if endpointError != "" {
+			errorText += fmt.Sprintf("\n  EndpointError: %s", endpointError)
+		}
 		if requestID != "" {
 			errorText += fmt.Sprintf("\n  RequestID: %s", requestID)
 		}
@@ -377,6 +382,88 @@ func summarizeBody(body []byte, max int) string {
 		return text
 	}
 	return text[:max] + "...(truncated)"
+}
+
+// summarizeEndpointError extracts common JSON error fields from endpoint responses.
+// It returns a compact single-line string suitable for logs and surfaced errors.
+func summarizeEndpointError(body []byte, max int) string {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+
+	parts := make([]string, 0, 6)
+	if v, ok := lookupJSONPath(payload, "error", "message"); ok {
+		parts = append(parts, fmt.Sprintf("message=%q", summarizeBody([]byte(stringifyJSONValue(v)), max)))
+	} else if v, ok := lookupJSONPath(payload, "message"); ok {
+		parts = append(parts, fmt.Sprintf("message=%q", summarizeBody([]byte(stringifyJSONValue(v)), max)))
+	}
+
+	if v, ok := lookupJSONPath(payload, "error", "type"); ok {
+		parts = append(parts, fmt.Sprintf("type=%s", stringifyJSONValue(v)))
+	}
+
+	if v, ok := lookupJSONPath(payload, "error", "code"); ok {
+		parts = append(parts, fmt.Sprintf("code=%s", stringifyJSONValue(v)))
+	} else if v, ok := lookupJSONPath(payload, "code"); ok {
+		parts = append(parts, fmt.Sprintf("code=%s", stringifyJSONValue(v)))
+	} else if v, ok := lookupJSONPath(payload, "error_code"); ok {
+		parts = append(parts, fmt.Sprintf("code=%s", stringifyJSONValue(v)))
+	}
+
+	if v, ok := lookupJSONPath(payload, "error", "param"); ok {
+		parts = append(parts, fmt.Sprintf("param=%s", stringifyJSONValue(v)))
+	}
+
+	if v, ok := lookupJSONPath(payload, "error", "request_id"); ok {
+		parts = append(parts, fmt.Sprintf("request_id=%s", stringifyJSONValue(v)))
+	} else if v, ok := lookupJSONPath(payload, "request_id"); ok {
+		parts = append(parts, fmt.Sprintf("request_id=%s", stringifyJSONValue(v)))
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+
+	joined := strings.Join(parts, ", ")
+	if max <= 0 || len(joined) <= max {
+		return joined
+	}
+	return joined[:max] + "...(truncated)"
+}
+
+// lookupJSONPath returns a nested value from a JSON map by path.
+func lookupJSONPath(root map[string]any, path ...string) (any, bool) {
+	var current any = root
+	for _, key := range path {
+		asMap, ok := current.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		next, ok := asMap[key]
+		if !ok {
+			return nil, false
+		}
+		current = next
+	}
+	return current, true
+}
+
+// stringifyJSONValue converts a JSON value into a compact single-line string.
+func stringifyJSONValue(value any) string {
+	switch typed := value.(type) {
+	case string:
+		v := strings.TrimSpace(typed)
+		v = strings.ReplaceAll(v, "\n", "\\n")
+		v = strings.ReplaceAll(v, "\r", "")
+		return v
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return fmt.Sprintf("%v", typed)
+		}
+		return string(encoded)
+	}
 }
 
 // firstNonEmpty returns the first non-empty trimmed string.

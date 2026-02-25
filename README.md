@@ -755,6 +755,31 @@ Respond HEARTBEAT_OK      User receives result directly
 
 The subagent has access to tools (message, web_search, etc.) and can communicate with the user independently without going through the main agent.
 
+#### Message Tool Rich Payload (Telegram)
+
+The `message` tool supports richer output for Telegram, including media files and inline buttons.
+
+```json
+{
+  "content": "Build finished. Choose next step:",
+  "attachments": [
+    {"type": "image", "url": "https://example.com/screenshot.png", "caption": "Latest result"},
+    {"type": "file", "path": "/tmp/report.pdf", "caption": "Detailed report"}
+  ],
+  "buttons": [
+    {"text": "Open Dashboard", "url": "https://example.com/dashboard", "row": 0},
+    {"text": "Deploy", "callback_data": "deploy:confirm", "row": 1}
+  ]
+}
+```
+
+Notes:
+
+- `attachments[].type` supports `photo`/`image` and `document`/`file`.
+- Each attachment needs one source: `url`, `file_id`, or `path`.
+- Each button needs exactly one action: `url` or `callback_data`.
+- Button callback clicks are routed back to the agent as inbound callback events.
+
 **Configuration:**
 
 ```json

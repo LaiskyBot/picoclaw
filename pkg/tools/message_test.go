@@ -4,17 +4,17 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/sipeed/picoclaw/pkg/bus"
 )
 
 func TestMessageTool_Execute_Success(t *testing.T) {
 	tool := NewMessageTool()
 	tool.SetContext("test-channel", "test-chat-id")
 
-	var sentChannel, sentChatID, sentContent string
-	tool.SetSendCallback(func(channel, chatID, content string) error {
-		sentChannel = channel
-		sentChatID = chatID
-		sentContent = content
+	var sent bus.OutboundMessage
+	tool.SetSendCallback(func(msg bus.OutboundMessage) error {
+		sent = msg
 		return nil
 	})
 
@@ -26,14 +26,14 @@ func TestMessageTool_Execute_Success(t *testing.T) {
 	result := tool.Execute(ctx, args)
 
 	// Verify message was sent with correct parameters
-	if sentChannel != "test-channel" {
-		t.Errorf("Expected channel 'test-channel', got '%s'", sentChannel)
+	if sent.Channel != "test-channel" {
+		t.Errorf("Expected channel 'test-channel', got '%s'", sent.Channel)
 	}
-	if sentChatID != "test-chat-id" {
-		t.Errorf("Expected chatID 'test-chat-id', got '%s'", sentChatID)
+	if sent.ChatID != "test-chat-id" {
+		t.Errorf("Expected chatID 'test-chat-id', got '%s'", sent.ChatID)
 	}
-	if sentContent != "Hello, world!" {
-		t.Errorf("Expected content 'Hello, world!', got '%s'", sentContent)
+	if sent.Content != "Hello, world!" {
+		t.Errorf("Expected content 'Hello, world!', got '%s'", sent.Content)
 	}
 
 	// Verify ToolResult meets US-011 criteria:
@@ -62,10 +62,9 @@ func TestMessageTool_Execute_WithCustomChannel(t *testing.T) {
 	tool := NewMessageTool()
 	tool.SetContext("default-channel", "default-chat-id")
 
-	var sentChannel, sentChatID string
-	tool.SetSendCallback(func(channel, chatID, content string) error {
-		sentChannel = channel
-		sentChatID = chatID
+	var sent bus.OutboundMessage
+	tool.SetSendCallback(func(msg bus.OutboundMessage) error {
+		sent = msg
 		return nil
 	})
 
@@ -79,11 +78,11 @@ func TestMessageTool_Execute_WithCustomChannel(t *testing.T) {
 	result := tool.Execute(ctx, args)
 
 	// Verify custom channel/chatID were used instead of defaults
-	if sentChannel != "custom-channel" {
-		t.Errorf("Expected channel 'custom-channel', got '%s'", sentChannel)
+	if sent.Channel != "custom-channel" {
+		t.Errorf("Expected channel 'custom-channel', got '%s'", sent.Channel)
 	}
-	if sentChatID != "custom-chat-id" {
-		t.Errorf("Expected chatID 'custom-chat-id', got '%s'", sentChatID)
+	if sent.ChatID != "custom-chat-id" {
+		t.Errorf("Expected chatID 'custom-chat-id', got '%s'", sent.ChatID)
 	}
 
 	if !result.Silent {
@@ -99,7 +98,7 @@ func TestMessageTool_Execute_SendFailure(t *testing.T) {
 	tool.SetContext("test-channel", "test-chat-id")
 
 	sendErr := errors.New("network error")
-	tool.SetSendCallback(func(channel, chatID, content string) error {
+	tool.SetSendCallback(func(msg bus.OutboundMessage) error {
 		return sendErr
 	})
 
@@ -153,7 +152,7 @@ func TestMessageTool_Execute_NoTargetChannel(t *testing.T) {
 	tool := NewMessageTool()
 	// No SetContext called, so defaultChannel and defaultChatID are empty
 
-	tool.SetSendCallback(func(channel, chatID, content string) error {
+	tool.SetSendCallback(func(msg bus.OutboundMessage) error {
 		return nil
 	})
 
@@ -255,5 +254,76 @@ func TestMessageTool_Parameters(t *testing.T) {
 	}
 	if chatIDProp["type"] != "string" {
 		t.Error("Expected chat_id type to be 'string'")
+	}
+}
+
+func TestMessageTool_Execute_WithAttachmentsAndButtons(t *testing.T) {
+	tool := NewMessageTool()
+	tool.SetContext("telegram", "123")
+
+	var sent bus.OutboundMessage
+	tool.SetSendCallback(func(msg bus.OutboundMessage) error {
+		sent = msg
+		return nil
+	})
+
+	result := tool.Execute(context.Background(), map[string]any{
+		"content": "Rich message",
+		"attachments": []any{
+			map[string]any{
+				"type": "image",
+				"url":  "https://example.com/a.png",
+			},
+			map[string]any{
+				"type":    "file",
+				"file_id": "abc123",
+			},
+		},
+		"buttons": []any{
+			map[string]any{
+				"text": "Open",
+				"url":  "https://example.com",
+			},
+			map[string]any{
+				"text":          "Run",
+				"callback_data": "run:1",
+				"row":           float64(1),
+			},
+		},
+	})
+
+	if result.IsError {
+		t.Fatalf("expected success, got error: %s", result.ForLLM)
+	}
+	if len(sent.Attachments) != 2 {
+		t.Fatalf("expected 2 attachments, got %d", len(sent.Attachments))
+	}
+	if sent.Attachments[0].Type != "photo" {
+		t.Fatalf("expected first attachment normalized type photo, got %s", sent.Attachments[0].Type)
+	}
+	if len(sent.Buttons) != 2 {
+		t.Fatalf("expected 2 buttons, got %d", len(sent.Buttons))
+	}
+	if sent.Buttons[1].Row != 1 {
+		t.Fatalf("expected second button row=1, got %d", sent.Buttons[1].Row)
+	}
+}
+
+func TestMessageTool_Execute_InvalidButtons(t *testing.T) {
+	tool := NewMessageTool()
+	tool.SetContext("telegram", "123")
+	tool.SetSendCallback(func(msg bus.OutboundMessage) error { return nil })
+
+	result := tool.Execute(context.Background(), map[string]any{
+		"content": "test",
+		"buttons": []any{
+			map[string]any{
+				"text": "Bad",
+			},
+		},
+	})
+
+	if !result.IsError {
+		t.Fatal("expected error for invalid button action")
 	}
 }

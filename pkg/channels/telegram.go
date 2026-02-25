@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -125,6 +126,10 @@ func (c *TelegramChannel) Start(ctx context.Context) error {
 		return c.handleMessage(ctx, &message)
 	}, th.AnyMessage())
 
+	bh.HandleCallbackQuery(func(ctx *th.Context, query telego.CallbackQuery) error {
+		return c.handleCallbackQuery(ctx, &query)
+	}, th.AnyCallbackQuery())
+
 	c.setRunning(true)
 	logger.InfoCF("telegram", "Telegram bot connected", map[string]any{
 		"username": c.bot.Username(),
@@ -156,55 +161,301 @@ func (c *TelegramChannel) Send(ctx context.Context, msg bus.OutboundMessage) err
 		return fmt.Errorf("invalid chat ID: %w", err)
 	}
 
-	// Stop thinking animation
-	if stop, ok := c.stopThinking.Load(msg.ChatID); ok {
-		if cf, ok := stop.(*thinkingCancel); ok && cf != nil {
-			cf.Cancel()
-		}
-		c.stopThinking.Delete(msg.ChatID)
+	c.stopThinkingForChat(msg.ChatID)
+
+	replyMarkup := buildTelegramInlineKeyboard(msg.Buttons)
+
+	if len(msg.Attachments) == 0 {
+		return c.sendTextResponse(ctx, chatID, msg.ChatID, msg.Content, replyMarkup)
 	}
 
-	htmlContent := markdownToTelegramHTML(msg.Content)
+	if strings.TrimSpace(msg.Content) != "" || replyMarkup != nil {
+		if err = c.sendTextResponse(ctx, chatID, msg.ChatID, msg.Content, replyMarkup); err != nil {
+			return err
+		}
+	} else {
+		c.clearThinkingPlaceholder(msg.ChatID)
+	}
 
-	// Try to edit placeholder
-	if pID, ok := c.placeholders.Load(msg.ChatID); ok {
-		c.placeholders.Delete(msg.ChatID)
+	for idx, attachment := range msg.Attachments {
+		if err = c.sendAttachment(ctx, chatID, attachment); err != nil {
+			return fmt.Errorf("send attachment[%d]: %w", idx, err)
+		}
+	}
+
+	logger.InfoCF("telegram", "Sent rich response", map[string]any{
+		"chat_id":        msg.ChatID,
+		"content_chars":  len(msg.Content),
+		"attachment_count": len(msg.Attachments),
+		"button_count":   len(msg.Buttons),
+	})
+
+	return nil
+}
+
+// sendTextResponse sends or edits a text response with optional inline keyboard.
+func (c *TelegramChannel) sendTextResponse(
+	ctx context.Context,
+	chatID int64,
+	chatIDStr, content string,
+	replyMarkup *telego.InlineKeyboardMarkup,
+) error {
+	htmlContent := markdownToTelegramHTML(content)
+	if strings.TrimSpace(htmlContent) == "" {
+		htmlContent = "Please choose an option."
+	}
+
+	if pID, ok := c.placeholders.Load(chatIDStr); ok {
+		c.placeholders.Delete(chatIDStr)
 		editMsg := tu.EditMessageText(tu.ID(chatID), pID.(int), htmlContent)
 		editMsg.ParseMode = telego.ModeHTML
+		editMsg.ReplyMarkup = replyMarkup
 
-		if _, err = c.bot.EditMessageText(ctx, editMsg); err == nil {
+		if _, err := c.bot.EditMessageText(ctx, editMsg); err == nil {
 			logger.InfoCF("telegram", "Edited thinking placeholder with final response", map[string]any{
-				"chat_id":      msg.ChatID,
-				"message_id":   pID.(int),
-				"content_chars": len(msg.Content),
+				"chat_id":       chatIDStr,
+				"message_id":    pID.(int),
+				"content_chars": len(content),
 			})
 			return nil
 		}
-		logger.WarnCF("telegram", "Failed to edit placeholder, will send a new message", map[string]any{
-			"chat_id":    msg.ChatID,
-			"message_id": pID.(int),
-			"error":      err.Error(),
-		})
-		// Fallback to new message if edit fails
 	}
 
 	tgMsg := tu.Message(tu.ID(chatID), htmlContent)
 	tgMsg.ParseMode = telego.ModeHTML
+	tgMsg.ReplyMarkup = replyMarkup
 
-	if _, err = c.bot.SendMessage(ctx, tgMsg); err != nil {
-		logger.ErrorCF("telegram", "HTML parse failed, falling back to plain text", map[string]any{
-			"error": err.Error(),
+	if _, err := c.bot.SendMessage(ctx, tgMsg); err != nil {
+		logger.WarnCF("telegram", "HTML parse failed, retrying plain text", map[string]any{
+			"chat_id": chatIDStr,
+			"error":   err.Error(),
 		})
 		tgMsg.ParseMode = ""
 		_, err = c.bot.SendMessage(ctx, tgMsg)
 		return err
 	}
 
-	logger.InfoCF("telegram", "Sent final response as a new message", map[string]any{
-		"chat_id":       msg.ChatID,
-		"content_chars": len(msg.Content),
-	})
+	return nil
+}
 
+// sendAttachment sends one Telegram media attachment as photo or document.
+func (c *TelegramChannel) sendAttachment(ctx context.Context, chatID int64, attachment bus.OutboundAttachment) error {
+	inputFile, cleanup, err := toTelegramInputFile(attachment)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	caption := markdownToTelegramHTML(attachment.Caption)
+	attachmentType := strings.ToLower(strings.TrimSpace(attachment.Type))
+	if attachmentType == "image" {
+		attachmentType = "photo"
+	}
+
+	switch attachmentType {
+	case "photo":
+		params := &telego.SendPhotoParams{
+			ChatID:    telego.ChatID{ID: chatID},
+			Photo:     inputFile,
+			Caption:   caption,
+			ParseMode: telego.ModeHTML,
+		}
+		_, err = c.bot.SendPhoto(ctx, params)
+		if err == nil {
+			return nil
+		}
+		params.ParseMode = ""
+		_, err = c.bot.SendPhoto(ctx, params)
+		return err
+	case "document", "file":
+		params := &telego.SendDocumentParams{
+			ChatID:    telego.ChatID{ID: chatID},
+			Document:  inputFile,
+			Caption:   caption,
+			ParseMode: telego.ModeHTML,
+		}
+		_, err = c.bot.SendDocument(ctx, params)
+		if err == nil {
+			return nil
+		}
+		params.ParseMode = ""
+		_, err = c.bot.SendDocument(ctx, params)
+		return err
+	default:
+		return fmt.Errorf("unsupported attachment type %q", attachment.Type)
+	}
+}
+
+// toTelegramInputFile converts an outbound attachment source to Telegram input format.
+func toTelegramInputFile(attachment bus.OutboundAttachment) (telego.InputFile, func(), error) {
+	if attachment.FileID != "" {
+		return telego.InputFile{FileID: attachment.FileID}, func() {}, nil
+	}
+
+	if attachment.URL != "" {
+		return telego.InputFile{URL: attachment.URL}, func() {}, nil
+	}
+
+	if attachment.Path != "" {
+		file, err := os.Open(attachment.Path)
+		if err != nil {
+			return telego.InputFile{}, func() {}, fmt.Errorf("open attachment path %q: %w", attachment.Path, err)
+		}
+		cleanup := func() {
+			_ = file.Close()
+		}
+		return telego.InputFile{File: file}, cleanup, nil
+	}
+
+	return telego.InputFile{}, func() {}, fmt.Errorf("attachment source is empty")
+}
+
+// buildTelegramInlineKeyboard creates Telegram inline keyboard markup grouped by button row.
+func buildTelegramInlineKeyboard(buttons []bus.OutboundButton) *telego.InlineKeyboardMarkup {
+	if len(buttons) == 0 {
+		return nil
+	}
+
+	rows := map[int][]telego.InlineKeyboardButton{}
+	for _, btn := range buttons {
+		if strings.TrimSpace(btn.Text) == "" {
+			continue
+		}
+
+		row := btn.Row
+		if row < 0 {
+			row = 0
+		}
+
+		keyboardButton := telego.InlineKeyboardButton{Text: btn.Text}
+		if btn.URL != "" {
+			keyboardButton.URL = btn.URL
+		} else if btn.CallbackData != "" {
+			keyboardButton.CallbackData = btn.CallbackData
+		} else {
+			continue
+		}
+
+		rows[row] = append(rows[row], keyboardButton)
+	}
+
+	if len(rows) == 0 {
+		return nil
+	}
+
+	rowIndexes := make([]int, 0, len(rows))
+	for row := range rows {
+		rowIndexes = append(rowIndexes, row)
+	}
+	sort.Ints(rowIndexes)
+
+	inlineRows := make([][]telego.InlineKeyboardButton, 0, len(rowIndexes))
+	for _, row := range rowIndexes {
+		inlineRows = append(inlineRows, rows[row])
+	}
+
+	return &telego.InlineKeyboardMarkup{InlineKeyboard: inlineRows}
+}
+
+// stopThinkingForChat stops active thinking indicators for a chat.
+func (c *TelegramChannel) stopThinkingForChat(chatID string) {
+	if stop, ok := c.stopThinking.Load(chatID); ok {
+		if cf, ok := stop.(*thinkingCancel); ok && cf != nil {
+			cf.Cancel()
+		}
+		c.stopThinking.Delete(chatID)
+	}
+}
+
+// clearThinkingPlaceholder removes placeholder tracking state for a chat.
+func (c *TelegramChannel) clearThinkingPlaceholder(chatID string) {
+	c.placeholders.Delete(chatID)
+}
+
+// sendThinkingPlaceholder sends Telegram typing state plus a temporary thinking message.
+func (c *TelegramChannel) sendThinkingPlaceholder(ctx context.Context, chatID int64, senderID string) {
+	err := c.bot.SendChatAction(ctx, tu.ChatAction(tu.ID(chatID), telego.ChatActionTyping))
+	if err != nil {
+		logger.ErrorCF("telegram", "Failed to send chat action", map[string]any{
+			"error": err.Error(),
+		})
+	}
+
+	chatIDStr := fmt.Sprintf("%d", chatID)
+	c.stopThinkingForChat(chatIDStr)
+
+	_, thinkCancel := context.WithTimeout(ctx, 5*time.Minute)
+	c.stopThinking.Store(chatIDStr, &thinkingCancel{fn: thinkCancel})
+
+	pMsg, err := c.bot.SendMessage(ctx, tu.Message(tu.ID(chatID), "Thinking... 💭"))
+	if err == nil {
+		c.placeholders.Store(chatIDStr, pMsg.MessageID)
+		return
+	}
+
+	logger.WarnCF("telegram", "Failed to send thinking placeholder", map[string]any{
+		"chat_id":   chatIDStr,
+		"sender_id": senderID,
+		"error":     err.Error(),
+	})
+}
+
+// handleCallbackQuery processes inline keyboard callback actions and publishes them to the agent bus.
+func (c *TelegramChannel) handleCallbackQuery(ctx context.Context, query *telego.CallbackQuery) error {
+	if query == nil {
+		return fmt.Errorf("callback query is nil")
+	}
+
+	from := query.From
+	senderID := fmt.Sprintf("%d", from.ID)
+	if from.Username != "" {
+		senderID = fmt.Sprintf("%d|%s", from.ID, from.Username)
+	}
+
+	if !c.IsAllowed(senderID) {
+		logger.DebugCF("telegram", "Callback query rejected by allowlist", map[string]any{"user_id": senderID})
+		return nil
+	}
+
+	if err := c.bot.AnswerCallbackQuery(ctx, &telego.AnswerCallbackQueryParams{
+		CallbackQueryID: query.ID,
+		Text:            "Received",
+	}); err != nil {
+		logger.WarnCF("telegram", "Failed to answer callback query", map[string]any{"error": err.Error()})
+	}
+
+	chatID := query.Message.GetChat().ID
+	if chatID == 0 {
+		logger.WarnCF("telegram", "Callback query has no chat ID", map[string]any{
+			"callback_query_id": query.ID,
+			"sender_id":         senderID,
+		})
+		return nil
+	}
+
+	messageID := query.Message.GetMessageID()
+	content := "[button callback]"
+	if strings.TrimSpace(query.Data) != "" {
+		content = fmt.Sprintf("[button callback: %s]", query.Data)
+	}
+
+	sendChatID := fmt.Sprintf("%d", chatID)
+	c.sendThinkingPlaceholder(ctx, chatID, senderID)
+
+	metadata := map[string]string{
+		"message_id":        fmt.Sprintf("%d", messageID),
+		"user_id":           fmt.Sprintf("%d", from.ID),
+		"username":          from.Username,
+		"first_name":        from.FirstName,
+		"is_group":          fmt.Sprintf("%t", query.Message.GetChat().Type != "private"),
+		"peer_kind":         map[bool]string{true: "group", false: "direct"}[query.Message.GetChat().Type != "private"],
+		"peer_id":           map[bool]string{true: sendChatID, false: fmt.Sprintf("%d", from.ID)}[query.Message.GetChat().Type != "private"],
+		"callback_query_id": query.ID,
+		"callback_data":     query.Data,
+		"is_callback":       "true",
+	}
+
+	c.HandleMessage(senderID, sendChatID, content, nil, metadata)
 	return nil
 }
 
@@ -343,42 +594,8 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Mes
 		"preview":   utils.Truncate(content, 50),
 	})
 
-	// Thinking indicator
-	err := c.bot.SendChatAction(ctx, tu.ChatAction(tu.ID(chatID), telego.ChatActionTyping))
-	if err != nil {
-		logger.ErrorCF("telegram", "Failed to send chat action", map[string]any{
-			"error": err.Error(),
-		})
-	}
-
-	// Stop any previous thinking animation
+	c.sendThinkingPlaceholder(ctx, chatID, senderID)
 	chatIDStr := fmt.Sprintf("%d", chatID)
-	if prevStop, ok := c.stopThinking.Load(chatIDStr); ok {
-		if cf, ok := prevStop.(*thinkingCancel); ok && cf != nil {
-			cf.Cancel()
-		}
-	}
-
-	// Create cancel function for thinking state
-	_, thinkCancel := context.WithTimeout(ctx, 5*time.Minute)
-	c.stopThinking.Store(chatIDStr, &thinkingCancel{fn: thinkCancel})
-
-	pMsg, err := c.bot.SendMessage(ctx, tu.Message(tu.ID(chatID), "Thinking... 💭"))
-	if err == nil {
-		pID := pMsg.MessageID
-		c.placeholders.Store(chatIDStr, pID)
-		logger.InfoCF("telegram", "Sent thinking placeholder", map[string]any{
-			"chat_id":    chatIDStr,
-			"message_id": pID,
-			"sender_id":  senderID,
-		})
-	} else {
-		logger.WarnCF("telegram", "Failed to send thinking placeholder", map[string]any{
-			"chat_id":   chatIDStr,
-			"sender_id": senderID,
-			"error":     err.Error(),
-		})
-	}
 
 	peerKind := "direct"
 	peerID := fmt.Sprintf("%d", user.ID)
