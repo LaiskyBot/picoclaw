@@ -107,9 +107,9 @@ func (sm *SubagentManager) Spawn(
 	go sm.runTask(ctx, subagentTask, callback)
 
 	if label != "" {
-		return fmt.Sprintf("Spawned subagent '%s' for task: %s", label, task), nil
+		return fmt.Sprintf("Spawned subagent '%s' (task_id=%s) for task: %s", label, taskID, task), nil
 	}
-	return fmt.Sprintf("Spawned subagent for task: %s", task), nil
+	return fmt.Sprintf("Spawned subagent (task_id=%s) for task: %s", taskID, task), nil
 }
 
 func (sm *SubagentManager) runTask(ctx context.Context, task *SubagentTask, callback AsyncCallback) {
@@ -217,7 +217,7 @@ After completing the task, provide a clear summary of what was done.`
 
 	// Send announce message back to main agent
 	if sm.bus != nil {
-		announceContent := fmt.Sprintf("Task '%s' completed.\n\nResult:\n%s", task.Label, task.Result)
+		announceContent := fmt.Sprintf("Subagent task id=%s label='%s' status=%s.\n\nResult:\n%s", task.ID, task.Label, task.Status, task.Result)
 		sm.bus.PublishInbound(bus.InboundMessage{
 			Channel:  "system",
 			SenderID: fmt.Sprintf("subagent:%s", task.ID),

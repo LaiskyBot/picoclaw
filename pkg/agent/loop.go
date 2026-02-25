@@ -34,6 +34,7 @@ type AgentLoop struct {
 	cfg            *config.Config
 	registry       *AgentRegistry
 	state          *state.Manager
+	taskPipeline   *TaskPipeline
 	running        atomic.Bool
 	summarizing    sync.Map
 	fallback       *providers.FallbackChain
@@ -65,17 +66,20 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 	// Create state manager using default agent's workspace for channel recording
 	defaultAgent := registry.GetDefaultAgent()
 	var stateManager *state.Manager
+	var taskPipeline *TaskPipeline
 	if defaultAgent != nil {
 		stateManager = state.NewManager(defaultAgent.Workspace)
+		taskPipeline = NewTaskPipeline(defaultAgent.Workspace, 0)
 	}
 
 	return &AgentLoop{
-		bus:         msgBus,
-		cfg:         cfg,
-		registry:    registry,
-		state:       stateManager,
-		summarizing: sync.Map{},
-		fallback:    fallbackChain,
+		bus:          msgBus,
+		cfg:          cfg,
+		registry:     registry,
+		state:        stateManager,
+		taskPipeline: taskPipeline,
+		summarizing:  sync.Map{},
+		fallback:     fallbackChain,
 	}
 }
 
@@ -155,6 +159,7 @@ func registerSharedTools(
 func (al *AgentLoop) Run(ctx context.Context) error {
 	al.running.Store(true)
 	logger.InfoC("agent", "Agent loop started")
+	al.startTaskPipelineRuntime(ctx)
 
 	for al.running.Load() {
 		select {
@@ -296,6 +301,31 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 		return response, nil
 	}
 
+	if msg.Channel == "telegram" && !constants.IsInternalChannel(msg.Channel) && al.taskPipeline != nil {
+		if response, handled := al.maybeHandleTaskControlCommand(msg); handled {
+			return response, nil
+		}
+
+		if IsStatusQuery(msg.Content) {
+			return al.taskPipeline.BuildStatusReply(msg.Channel, msg.ChatID, msg.SenderID), nil
+		}
+
+		task, err := al.taskPipeline.EnqueueTask(msg.Channel, msg.ChatID, msg.SenderID, msg.Content)
+		if err != nil {
+			logger.ErrorCF("agent", "Failed to enqueue delegated task", map[string]any{
+				"channel": msg.Channel,
+				"chat_id": msg.ChatID,
+				"error":   err.Error(),
+			})
+			return "Failed to enqueue your task for background planning. Please retry.", nil
+		}
+
+		return fmt.Sprintf(
+			"Task %s accepted. I have delegated it to the planner and will keep you updated. Send /status anytime for progress.",
+			task.ID,
+		), nil
+	}
+
 	// Route to determine agent and session key
 	route := al.registry.ResolveRoute(routing.RouteInput{
 		Channel:    msg.Channel,
@@ -354,6 +384,27 @@ func (al *AgentLoop) processSystemMessage(ctx context.Context, msg bus.InboundMe
 	} else {
 		originChannel = "cli"
 		originChatID = msg.ChatID
+	}
+
+	if originChannel == plannerTaskChannel && al.taskPipeline != nil {
+		event := fmt.Sprintf("%s: %s", msg.SenderID, msg.Content)
+		if !al.taskPipeline.AppendWorkerEvent(originChatID, event) {
+			logger.WarnCF("agent", "Worker update for unknown pipeline task", map[string]any{
+				"pipeline_task_id": originChatID,
+				"sender_id":        msg.SenderID,
+			})
+			return "", nil
+		}
+
+		task, ok := al.taskPipeline.GetTaskByID(originChatID)
+		if ok {
+			al.bus.PublishOutbound(bus.OutboundMessage{
+				Channel: task.Channel,
+				ChatID:  task.ChatID,
+				Content: fmt.Sprintf("Worker update for %s:\n%s", task.ID, msg.Content),
+			})
+		}
+		return "", nil
 	}
 
 	// Extract subagent result from message content

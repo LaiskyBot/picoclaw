@@ -63,6 +63,15 @@ Configuration is JSON-based (`config/config.example.json`) with env override sup
 
 Local tools and debugging related sensitive information is saved in `.github/instructions/laisky.instructions.md`.
 
+### Deployment
+
+Configuration file location: `~/.picoclaw/config.json`
+
+```sh
+make install
+sudo systemctl restart picoclaw-gateway.service
+```
+
 ## General
 
 Every single code file should not exceed 800 lines. If a file exceeds this limit, please split it into smaller files based on functionality. Automatically generated files are exempt from this rule.
