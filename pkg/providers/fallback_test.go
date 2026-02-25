@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+func init() {
+	defaultImmediateRetryDelay = time.Millisecond
+}
+
 func makeCandidate(provider, model string) FallbackCandidate {
 	return FallbackCandidate{Provider: provider, Model: model}
 }
@@ -34,6 +38,32 @@ func TestFallback_SingleCandidate_Success(t *testing.T) {
 	}
 }
 
+func TestFallback_SingleCandidate_RetryThenSuccess(t *testing.T) {
+	ct := NewCooldownTracker()
+	fc := NewFallbackChain(ct)
+
+	candidates := []FallbackCandidate{makeCandidate("openai", "gpt-4")}
+	attempt := 0
+	run := func(ctx context.Context, provider, model string) (*LLMResponse, error) {
+		attempt++
+		if attempt == 1 {
+			return nil, errors.New("upstream restarting")
+		}
+		return &LLMResponse{Content: "ok after retry", FinishReason: "stop"}, nil
+	}
+
+	result, err := fc.Execute(context.Background(), candidates, run)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Response.Content != "ok after retry" {
+		t.Errorf("content = %q, want ok after retry", result.Response.Content)
+	}
+	if attempt != 2 {
+		t.Errorf("attempt = %d, want 2", attempt)
+	}
+}
+
 func TestFallback_SecondCandidateSuccess(t *testing.T) {
 	ct := NewCooldownTracker()
 	fc := NewFallbackChain(ct)
@@ -56,14 +86,14 @@ func TestFallback_SecondCandidateSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.Provider != "anthropic" {
-		t.Errorf("provider = %q, want anthropic", result.Provider)
+	if result.Provider != "openai" {
+		t.Errorf("provider = %q, want openai", result.Provider)
 	}
 	if result.Response.Content != "from claude" {
 		t.Errorf("content = %q, want 'from claude'", result.Response.Content)
 	}
-	if len(result.Attempts) != 1 {
-		t.Errorf("attempts = %d, want 1 (failed attempt recorded)", len(result.Attempts))
+	if len(result.Attempts) != 0 {
+		t.Errorf("attempts = %d, want 0 (success after immediate retry)", len(result.Attempts))
 	}
 }
 
@@ -147,8 +177,8 @@ func TestFallback_NonRetriableError(t *testing.T) {
 	if fe.Reason != FailoverFormat {
 		t.Errorf("reason = %q, want format", fe.Reason)
 	}
-	if attempt != 1 {
-		t.Errorf("attempt = %d, want 1 (non-retriable should not try next)", attempt)
+	if attempt != 2 {
+		t.Errorf("attempt = %d, want 2 (fail only after two consecutive failures)", attempt)
 	}
 }
 
@@ -263,8 +293,8 @@ func TestFallback_UnclassifiedError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unclassified error")
 	}
-	if attempt != 1 {
-		t.Errorf("attempt = %d, want 1 (should not fallback on unclassified)", attempt)
+	if attempt != 2 {
+		t.Errorf("attempt = %d, want 2 (should only fail after consecutive retries)", attempt)
 	}
 }
 
@@ -327,8 +357,8 @@ func TestImageFallback_DimensionError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for image dimension error")
 	}
-	if attempt != 1 {
-		t.Errorf("attempt = %d, want 1 (image dimension error should not retry)", attempt)
+	if attempt != 2 {
+		t.Errorf("attempt = %d, want 2 (image request should retry once)", attempt)
 	}
 }
 
@@ -351,8 +381,8 @@ func TestImageFallback_SizeError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for image size error")
 	}
-	if attempt != 1 {
-		t.Errorf("attempt = %d, want 1 (image size error should not retry)", attempt)
+	if attempt != 2 {
+		t.Errorf("attempt = %d, want 2 (image request should retry once)", attempt)
 	}
 }
 
@@ -378,8 +408,8 @@ func TestImageFallback_RetryOnOtherErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.Provider != "anthropic" {
-		t.Errorf("provider = %q, want anthropic", result.Provider)
+	if result.Provider != "openai" {
+		t.Errorf("provider = %q, want openai", result.Provider)
 	}
 }
 

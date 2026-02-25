@@ -7,9 +7,12 @@ import (
 	"time"
 )
 
+var defaultImmediateRetryDelay = time.Second
+
 // FallbackChain orchestrates model fallback across multiple candidates.
 type FallbackChain struct {
 	cooldown *CooldownTracker
+	retryDelay time.Duration
 }
 
 // FallbackCandidate represents one model/provider to try.
@@ -38,7 +41,46 @@ type FallbackAttempt struct {
 
 // NewFallbackChain creates a new fallback chain with the given cooldown tracker.
 func NewFallbackChain(cooldown *CooldownTracker) *FallbackChain {
-	return &FallbackChain{cooldown: cooldown}
+	return &FallbackChain{cooldown: cooldown, retryDelay: defaultImmediateRetryDelay}
+}
+
+// runWithImmediateRetry executes one provider/model request and retries once after retryDelay.
+// The ctx parameter controls cancellation while waiting and during request execution.
+// It returns the response on success, total elapsed duration, and the final error after retry.
+func (fc *FallbackChain) runWithImmediateRetry(
+	ctx context.Context,
+	provider string,
+	model string,
+	run func(ctx context.Context, provider, model string) (*LLMResponse, error),
+) (*LLMResponse, time.Duration, error) {
+	start := time.Now()
+
+	resp, err := run(ctx, provider, model)
+	if err == nil {
+		return resp, time.Since(start), nil
+	}
+
+	if ctx.Err() == context.Canceled {
+		return nil, time.Since(start), context.Canceled
+	}
+
+	if fc.retryDelay > 0 {
+		timer := time.NewTimer(fc.retryDelay)
+		defer timer.Stop()
+
+		select {
+		case <-ctx.Done():
+			return nil, time.Since(start), context.Canceled
+		case <-timer.C:
+		}
+	}
+
+	resp, err = run(ctx, provider, model)
+	if err != nil && ctx.Err() == context.Canceled {
+		return nil, time.Since(start), context.Canceled
+	}
+
+	return resp, time.Since(start), err
 }
 
 // ResolveCandidates parses model config into a deduplicated candidate list.
@@ -119,10 +161,8 @@ func (fc *FallbackChain) Execute(
 			continue
 		}
 
-		// Execute the run function.
-		start := time.Now()
-		resp, err := run(ctx, candidate.Provider, candidate.Model)
-		elapsed := time.Since(start)
+		// Execute the run function with one immediate retry.
+		resp, elapsed, err := fc.runWithImmediateRetry(ctx, candidate.Provider, candidate.Model, run)
 
 		if err == nil {
 			// Success.
@@ -212,9 +252,7 @@ func (fc *FallbackChain) ExecuteImage(
 			return nil, context.Canceled
 		}
 
-		start := time.Now()
-		resp, err := run(ctx, candidate.Provider, candidate.Model)
-		elapsed := time.Since(start)
+		resp, elapsed, err := fc.runWithImmediateRetry(ctx, candidate.Provider, candidate.Model, run)
 
 		if err == nil {
 			result.Response = resp
