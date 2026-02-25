@@ -209,7 +209,7 @@ func (c *TelegramChannel) sendTextResponse(
 		c.placeholders.Delete(chatIDStr)
 		editMsg := tu.EditMessageText(tu.ID(chatID), pID.(int), htmlContent)
 		editMsg.ParseMode = telego.ModeHTML
-		editMsg.ReplyMarkup = replyMarkup
+		applyTelegramReplyMarkupToEditMessage(editMsg, replyMarkup)
 
 		if _, err := c.bot.EditMessageText(ctx, editMsg); err == nil {
 			logger.InfoCF("telegram", "Edited thinking placeholder with final response", map[string]any{
@@ -218,24 +218,77 @@ func (c *TelegramChannel) sendTextResponse(
 				"content_chars": len(content),
 			})
 			return nil
+		} else {
+			logger.DebugCF("telegram", "Failed to edit thinking placeholder with HTML, retrying plain text", map[string]any{
+				"chat_id":              chatIDStr,
+				"message_id":           pID.(int),
+				"content_chars":        len(content),
+				"reply_markup_present": replyMarkup != nil,
+				"error":                err.Error(),
+			})
+
+			editMsg.ParseMode = ""
+			if _, plainErr := c.bot.EditMessageText(ctx, editMsg); plainErr == nil {
+				logger.InfoCF("telegram", "Edited thinking placeholder with plain text fallback", map[string]any{
+					"chat_id":       chatIDStr,
+					"message_id":    pID.(int),
+					"content_chars": len(content),
+				})
+				return nil
+			}
 		}
 	}
 
 	tgMsg := tu.Message(tu.ID(chatID), htmlContent)
 	tgMsg.ParseMode = telego.ModeHTML
-	tgMsg.ReplyMarkup = replyMarkup
+	applyTelegramReplyMarkupToSendMessage(tgMsg, replyMarkup)
 
 	if _, err := c.bot.SendMessage(ctx, tgMsg); err != nil {
 		logger.WarnCF("telegram", "HTML parse failed, retrying plain text", map[string]any{
-			"chat_id": chatIDStr,
-			"error":   err.Error(),
+			"chat_id":              chatIDStr,
+			"reply_markup_present": replyMarkup != nil,
+			"error":                err.Error(),
 		})
 		tgMsg.ParseMode = ""
 		_, err = c.bot.SendMessage(ctx, tgMsg)
+		if err != nil {
+			logger.DebugCF("telegram", "Plain text fallback send failed", map[string]any{
+				"chat_id":              chatIDStr,
+				"reply_markup_present": replyMarkup != nil,
+				"content_chars":        len(content),
+				"error":                err.Error(),
+			})
+		}
 		return err
 	}
 
 	return nil
+}
+
+// applyTelegramReplyMarkupToSendMessage assigns inline keyboard markup to send params when markup is non-nil.
+// It accepts the destination send params and optional inline keyboard markup, and it returns no values.
+func applyTelegramReplyMarkupToSendMessage(
+	msg *telego.SendMessageParams,
+	replyMarkup *telego.InlineKeyboardMarkup,
+) {
+	if msg == nil || replyMarkup == nil {
+		return
+	}
+
+	msg.ReplyMarkup = replyMarkup
+}
+
+// applyTelegramReplyMarkupToEditMessage assigns inline keyboard markup to edit params when markup is non-nil.
+// It accepts the destination edit params and optional inline keyboard markup, and it returns no values.
+func applyTelegramReplyMarkupToEditMessage(
+	msg *telego.EditMessageTextParams,
+	replyMarkup *telego.InlineKeyboardMarkup,
+) {
+	if msg == nil || replyMarkup == nil {
+		return
+	}
+
+	msg.ReplyMarkup = replyMarkup
 }
 
 // sendAttachment sends one Telegram media attachment as photo or document.

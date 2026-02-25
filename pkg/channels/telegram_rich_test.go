@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/mymmrac/telego"
 	"github.com/stretchr/testify/require"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
@@ -45,4 +46,48 @@ func TestToTelegramInputFile(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, pathInput.File)
 	cleanup()
+}
+
+func TestApplyTelegramReplyMarkupToSendMessage(t *testing.T) {
+	t.Run("nil markup keeps reply markup unset", func(t *testing.T) {
+		params := &telego.SendMessageParams{}
+		applyTelegramReplyMarkupToSendMessage(params, nil)
+		require.Nil(t, params.ReplyMarkup)
+	})
+
+	t.Run("non nil markup is assigned", func(t *testing.T) {
+		params := &telego.SendMessageParams{}
+		replyMarkup := &telego.InlineKeyboardMarkup{
+			InlineKeyboard: [][]telego.InlineKeyboardButton{{
+				{Text: "A", CallbackData: "a"},
+			}},
+		}
+
+		applyTelegramReplyMarkupToSendMessage(params, replyMarkup)
+		require.NotNil(t, params.ReplyMarkup)
+		assigned, ok := params.ReplyMarkup.(*telego.InlineKeyboardMarkup)
+		require.True(t, ok)
+		require.Equal(t, replyMarkup, assigned)
+	})
+}
+
+func TestApplyTelegramReplyMarkupToEditMessage(t *testing.T) {
+	t.Run("nil markup keeps reply markup unset", func(t *testing.T) {
+		params := &telego.EditMessageTextParams{}
+		applyTelegramReplyMarkupToEditMessage(params, nil)
+		require.Nil(t, params.ReplyMarkup)
+	})
+
+	t.Run("non nil markup is assigned", func(t *testing.T) {
+		params := &telego.EditMessageTextParams{}
+		replyMarkup := &telego.InlineKeyboardMarkup{
+			InlineKeyboard: [][]telego.InlineKeyboardButton{{
+				{Text: "A", CallbackData: "a"},
+			}},
+		}
+
+		applyTelegramReplyMarkupToEditMessage(params, replyMarkup)
+		require.NotNil(t, params.ReplyMarkup)
+		require.Equal(t, replyMarkup, params.ReplyMarkup)
+	})
 }
