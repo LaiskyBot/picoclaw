@@ -105,8 +105,7 @@ func TestAgentLoop_ProcessMessage_DelegatesExternalTasks(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Contains(t, statusResponse, "Task status:")
-	require.Contains(t, statusResponse, "task-")
-	require.Contains(t, statusResponse, "summary=")
+	require.Regexp(t, regexp.MustCompile(`task-\d{4}-\d{2}-\d{2}-\d{4}\([^)]+\)`), statusResponse)
 }
 
 // TestTaskPipeline_PromoteRunnableQueuedTasks verifies waiting tasks are promoted when dependencies finish.

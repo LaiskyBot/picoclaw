@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -779,8 +780,9 @@ func TestProcessMessage_ExternalChannelsDelegateWithoutForegroundLLM(t *testing.
 			})
 			require.NoError(t, runErr)
 			require.Contains(t, response, "accepted. I have delegated it to the planner")
-			require.Zero(t, provider.Calls(), "chat dispatch path must not call provider directly")
+			require.EqualValues(t, 1, provider.Calls(), "task creation should call provider once for task brief generation")
 			require.True(t, strings.Contains(strings.ToLower(response), "task "))
+			require.Regexp(t, regexp.MustCompile(`task-\d{4}-\d{2}-\d{2}-\d{4}\([^)]+\)`), response)
 		})
 	}
 }

@@ -45,18 +45,17 @@
 > [!CAUTION]
 > **🚨 SECURITY & OFFICIAL CHANNELS / 安全声明**
 >
-> * **NO CRYPTO:** PicoClaw has **NO** official token/coin. All claims on `pump.fun` or other trading platforms are **SCAMS**.
->
-> * **OFFICIAL DOMAIN:** The **ONLY** official website is **[picoclaw.io](https://picoclaw.io)**, and company website is **[sipeed.com](https://sipeed.com)**
-> * **Warning:** Many `.ai/.org/.com/.net/...` domains are registered by third parties.
-> * **Warning:** picoclaw is in early development now and may have unresolved network security issues. Do not deploy to production environments before the v1.0 release.
-> * **Note:** picoclaw has recently merged a lot of PRs, which may result in a larger memory footprint (10–20MB) in the latest versions. We plan to prioritize resource optimization as soon as the current feature set reaches a stable state.
+> - **NO CRYPTO:** PicoClaw has **NO** official token/coin. All claims on `pump.fun` or other trading platforms are **SCAMS**.
+> - **OFFICIAL DOMAIN:** The **ONLY** official website is **[picoclaw.io](https://picoclaw.io)**, and company website is **[sipeed.com](https://sipeed.com)**
+> - **Warning:** Many `.ai/.org/.com/.net/...` domains are registered by third parties.
+> - **Warning:** picoclaw is in early development now and may have unresolved network security issues. Do not deploy to production environments before the v1.0 release.
+> - **Note:** picoclaw has recently merged a lot of PRs, which may result in a larger memory footprint (10–20MB) in the latest versions. We plan to prioritize resource optimization as soon as the current feature set reaches a stable state.
 
 ## 📢 News
 
 2026-02-16 🎉 PicoClaw hit 12K stars in one week! Thank you all for your support! PicoClaw is growing faster than we ever imagined. Given the high volume of PRs, we urgently need community maintainers. Our volunteer roles and roadmap are officially posted [here](docs/ROADMAP.md) —we can’t wait to have you on board!
 
-2026-02-13 🎉 PicoClaw hit 5000 stars in 4days! Thank you for the community! There are so many PRs & issues coming in (during Chinese New Year holidays), we are finalizing the Project Roadmap and setting up the Developer Group to accelerate PicoClaw's development.  
+2026-02-13 🎉 PicoClaw hit 5000 stars in 4days! Thank you for the community! There are so many PRs & issues coming in (during Chinese New Year holidays), we are finalizing the Project Roadmap and setting up the Developer Group to accelerate PicoClaw's development.
 🚀 Call to Action: Please submit your feature requests in GitHub Discussions. We will review and prioritize them during our upcoming weekly meeting.
 
 2026-02-09 🎉 PicoClaw Launched! Built in 1 day to bring AI Agents to $10 hardware with <10MB RAM. 🦐 PicoClaw，Let's Go！
@@ -219,45 +218,45 @@ picoclaw onboard
 
 ```json
 {
-  "agents": {
-    "defaults": {
-      "workspace": "~/.picoclaw/workspace",
-      "model_name": "gpt4",
-      "max_tokens": 8192,
-      "temperature": 0.7,
-      "max_tool_iterations": 20
-    }
-  },
-  "model_list": [
-    {
-      "model_name": "gpt4",
-      "model": "openai/gpt-5.2",
-      "api_key": "your-api-key"
+    "agents": {
+        "defaults": {
+            "workspace": "~/.picoclaw/workspace",
+            "model_name": "gpt4",
+            "max_tokens": 8192,
+            "temperature": 0.7,
+            "max_tool_iterations": 20
+        }
     },
-    {
-      "model_name": "claude-sonnet-4.6",
-      "model": "anthropic/claude-sonnet-4.6",
-      "api_key": "your-anthropic-key"
+    "model_list": [
+        {
+            "model_name": "gpt4",
+            "model": "openai/gpt-5.2",
+            "api_key": "your-api-key"
+        },
+        {
+            "model_name": "claude-sonnet-4.6",
+            "model": "anthropic/claude-sonnet-4.6",
+            "api_key": "your-anthropic-key"
+        }
+    ],
+    "tools": {
+        "web": {
+            "brave": {
+                "enabled": false,
+                "api_key": "YOUR_BRAVE_API_KEY",
+                "max_results": 5
+            },
+            "tavily": {
+                "enabled": false,
+                "api_key": "YOUR_TAVILY_API_KEY",
+                "max_results": 5
+            },
+            "duckduckgo": {
+                "enabled": true,
+                "max_results": 5
+            }
+        }
     }
-  ],
-  "tools": {
-    "web": {
-      "brave": {
-        "enabled": false,
-        "api_key": "YOUR_BRAVE_API_KEY",
-        "max_results": 5
-      },
-      "tavily": {
-        "enabled": false,
-        "api_key": "YOUR_TAVILY_API_KEY",
-        "max_results": 5
-      },
-      "duckduckgo": {
-        "enabled": true,
-        "max_results": 5
-      }
-    }
-  }
 }
 ```
 
@@ -265,8 +264,8 @@ picoclaw onboard
 
 **3. Get API Keys**
 
-* **LLM Provider**: [OpenRouter](https://openrouter.ai/keys) · [Zhipu](https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys) · [Anthropic](https://console.anthropic.com) · [OpenAI](https://platform.openai.com) · [Gemini](https://aistudio.google.com/api-keys)
-* **Web Search** (optional): [Tavily](https://tavily.com) - Optimized for AI Agents (1000 requests/month) · [Brave Search](https://brave.com/search/api) - Free tier available (2000 requests/month)
+- **LLM Provider**: [OpenRouter](https://openrouter.ai/keys) · [Zhipu](https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys) · [Anthropic](https://console.anthropic.com) · [OpenAI](https://platform.openai.com) · [Gemini](https://aistudio.google.com/api-keys)
+- **Web Search** (optional): [Tavily](https://tavily.com) - Optimized for AI Agents (1000 requests/month) · [Brave Search](https://brave.com/search/api) - Free tier available (2000 requests/month)
 
 > **Note**: See `config.example.json` for a complete configuration template.
 
@@ -298,21 +297,21 @@ Talk to your picoclaw through Telegram, Discord, DingTalk, LINE, or WeCom
 
 **1. Create a bot**
 
-* Open Telegram, search `@BotFather`
-* Send `/newbot`, follow prompts
-* Copy the token
+- Open Telegram, search `@BotFather`
+- Send `/newbot`, follow prompts
+- Copy the token
 
 **2. Configure**
 
 ```json
 {
-  "channels": {
-    "telegram": {
-      "enabled": true,
-      "token": "YOUR_BOT_TOKEN",
-      "allow_from": ["YOUR_USER_ID"]
+    "channels": {
+        "telegram": {
+            "enabled": true,
+            "token": "YOUR_BOT_TOKEN",
+            "allow_from": ["YOUR_USER_ID"]
+        }
     }
-  }
 }
 ```
 
@@ -331,40 +330,41 @@ picoclaw gateway
 
 **1. Create a bot**
 
-* Go to <https://discord.com/developers/applications>
-* Create an application → Bot → Add Bot
-* Copy the bot token
+- Go to <https://discord.com/developers/applications>
+- Create an application → Bot → Add Bot
+- Copy the bot token
 
 **2. Enable intents**
 
-* In the Bot settings, enable **MESSAGE CONTENT INTENT**
-* (Optional) Enable **SERVER MEMBERS INTENT** if you plan to use allow lists based on member data
+- In the Bot settings, enable **MESSAGE CONTENT INTENT**
+- (Optional) Enable **SERVER MEMBERS INTENT** if you plan to use allow lists based on member data
 
 **3. Get your User ID**
-* Discord Settings → Advanced → enable **Developer Mode**
-* Right-click your avatar → **Copy User ID**
+
+- Discord Settings → Advanced → enable **Developer Mode**
+- Right-click your avatar → **Copy User ID**
 
 **4. Configure**
 
 ```json
 {
-  "channels": {
-    "discord": {
-      "enabled": true,
-      "token": "YOUR_BOT_TOKEN",
-      "allow_from": ["YOUR_USER_ID"],
-      "mention_only": false
+    "channels": {
+        "discord": {
+            "enabled": true,
+            "token": "YOUR_BOT_TOKEN",
+            "allow_from": ["YOUR_USER_ID"],
+            "mention_only": false
+        }
     }
-  }
 }
 ```
 
 **5. Invite the bot**
 
-* OAuth2 → URL Generator
-* Scopes: `bot`
-* Bot Permissions: `Send Messages`, `Read Message History`
-* Open the generated invite URL and add the bot to your server
+- OAuth2 → URL Generator
+- Scopes: `bot`
+- Bot Permissions: `Send Messages`, `Read Message History`
+- Open the generated invite URL and add the bot to your server
 
 **Optional: Mention-only mode**
 
@@ -390,14 +390,14 @@ picoclaw gateway
 
 ```json
 {
-  "channels": {
-    "qq": {
-      "enabled": true,
-      "app_id": "YOUR_APP_ID",
-      "app_secret": "YOUR_APP_SECRET",
-      "allow_from": []
+    "channels": {
+        "qq": {
+            "enabled": true,
+            "app_id": "YOUR_APP_ID",
+            "app_secret": "YOUR_APP_SECRET",
+            "allow_from": []
+        }
     }
-  }
 }
 ```
 
@@ -416,22 +416,22 @@ picoclaw gateway
 
 **1. Create a bot**
 
-* Go to [Open Platform](https://open.dingtalk.com/)
-* Create an internal app
-* Copy Client ID and Client Secret
+- Go to [Open Platform](https://open.dingtalk.com/)
+- Create an internal app
+- Copy Client ID and Client Secret
 
 **2. Configure**
 
 ```json
 {
-  "channels": {
-    "dingtalk": {
-      "enabled": true,
-      "client_id": "YOUR_CLIENT_ID",
-      "client_secret": "YOUR_CLIENT_SECRET",
-      "allow_from": []
+    "channels": {
+        "dingtalk": {
+            "enabled": true,
+            "client_id": "YOUR_CLIENT_ID",
+            "client_secret": "YOUR_CLIENT_SECRET",
+            "allow_from": []
+        }
     }
-  }
 }
 ```
 
@@ -442,6 +442,7 @@ picoclaw gateway
 ```bash
 picoclaw gateway
 ```
+
 </details>
 
 <details>
@@ -457,17 +458,17 @@ picoclaw gateway
 
 ```json
 {
-  "channels": {
-    "line": {
-      "enabled": true,
-      "channel_secret": "YOUR_CHANNEL_SECRET",
-      "channel_access_token": "YOUR_CHANNEL_ACCESS_TOKEN",
-      "webhook_host": "0.0.0.0",
-      "webhook_port": 18791,
-      "webhook_path": "/webhook/line",
-      "allow_from": []
+    "channels": {
+        "line": {
+            "enabled": true,
+            "channel_secret": "YOUR_CHANNEL_SECRET",
+            "channel_access_token": "YOUR_CHANNEL_ACCESS_TOKEN",
+            "webhook_host": "0.0.0.0",
+            "webhook_port": 18791,
+            "webhook_path": "/webhook/line",
+            "allow_from": []
+        }
     }
-  }
 }
 ```
 
@@ -508,25 +509,25 @@ See [WeCom App Configuration Guide](docs/wecom-app-configuration.md) for detaile
 
 **1. Create a bot**
 
-* Go to WeCom Admin Console → Group Chat → Add Group Bot
-* Copy the webhook URL (format: `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx`)
+- Go to WeCom Admin Console → Group Chat → Add Group Bot
+- Copy the webhook URL (format: `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx`)
 
 **2. Configure**
 
 ```json
 {
-  "channels": {
-    "wecom": {
-      "enabled": true,
-      "token": "YOUR_TOKEN",
-      "encoding_aes_key": "YOUR_ENCODING_AES_KEY",
-      "webhook_url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY",
-      "webhook_host": "0.0.0.0",
-      "webhook_port": 18793,
-      "webhook_path": "/webhook/wecom",
-      "allow_from": []
+    "channels": {
+        "wecom": {
+            "enabled": true,
+            "token": "YOUR_TOKEN",
+            "encoding_aes_key": "YOUR_ENCODING_AES_KEY",
+            "webhook_url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY",
+            "webhook_host": "0.0.0.0",
+            "webhook_port": 18793,
+            "webhook_path": "/webhook/wecom",
+            "allow_from": []
+        }
     }
-  }
 }
 ```
 
@@ -534,33 +535,33 @@ See [WeCom App Configuration Guide](docs/wecom-app-configuration.md) for detaile
 
 **1. Create an app**
 
-* Go to WeCom Admin Console → App Management → Create App
-* Copy **AgentId** and **Secret**
-* Go to "My Company" page, copy **CorpID**
-**2. Configure receive message**
+- Go to WeCom Admin Console → App Management → Create App
+- Copy **AgentId** and **Secret**
+- Go to "My Company" page, copy **CorpID**
+  **2. Configure receive message**
 
-* In App details, click "Receive Message" → "Set API"
-* Set URL to `http://your-server:18792/webhook/wecom-app`
-* Generate **Token** and **EncodingAESKey**
+- In App details, click "Receive Message" → "Set API"
+- Set URL to `http://your-server:18792/webhook/wecom-app`
+- Generate **Token** and **EncodingAESKey**
 
 **3. Configure**
 
 ```json
 {
-  "channels": {
-    "wecom_app": {
-      "enabled": true,
-      "corp_id": "wwxxxxxxxxxxxxxxxx",
-      "corp_secret": "YOUR_CORP_SECRET",
-      "agent_id": 1000002,
-      "token": "YOUR_TOKEN",
-      "encoding_aes_key": "YOUR_ENCODING_AES_KEY",
-      "webhook_host": "0.0.0.0",
-      "webhook_port": 18792,
-      "webhook_path": "/webhook/wecom-app",
-      "allow_from": []
+    "channels": {
+        "wecom_app": {
+            "enabled": true,
+            "corp_id": "wwxxxxxxxxxxxxxxxx",
+            "corp_secret": "YOUR_CORP_SECRET",
+            "agent_id": 1000002,
+            "token": "YOUR_TOKEN",
+            "encoding_aes_key": "YOUR_ENCODING_AES_KEY",
+            "webhook_host": "0.0.0.0",
+            "webhook_port": 18792,
+            "webhook_path": "/webhook/wecom-app",
+            "allow_from": []
+        }
     }
-  }
 }
 ```
 
@@ -611,12 +612,12 @@ PicoClaw runs in a sandboxed environment by default. The agent can only access f
 
 ```json
 {
-  "agents": {
-    "defaults": {
-      "workspace": "~/.picoclaw/workspace",
-      "restrict_to_workspace": true
+    "agents": {
+        "defaults": {
+            "workspace": "~/.picoclaw/workspace",
+            "restrict_to_workspace": true
+        }
     }
-  }
 }
 ```
 
@@ -642,12 +643,12 @@ When `restrict_to_workspace: true`, the following tools are sandboxed:
 
 Even with `restrict_to_workspace: false`, the `exec` tool blocks these dangerous commands:
 
-* `rm -rf`, `del /f`, `rmdir /s` — Bulk deletion
-* `format`, `mkfs`, `diskpart` — Disk formatting
-* `dd if=` — Disk imaging
-* Writing to `/dev/sd[a-z]` — Direct disk writes
-* `shutdown`, `reboot`, `poweroff` — System shutdown
-* Fork bomb `:(){ :|:& };:`
+- `rm -rf`, `del /f`, `rmdir /s` — Bulk deletion
+- `format`, `mkfs`, `diskpart` — Disk formatting
+- `dd if=` — Disk imaging
+- Writing to `/dev/sd[a-z]` — Direct disk writes
+- `shutdown`, `reboot`, `poweroff` — System shutdown
+- Fork bomb `:(){ :|:& };:`
 
 #### Error Examples
 
@@ -669,11 +670,11 @@ If you need the agent to access paths outside the workspace:
 
 ```json
 {
-  "agents": {
-    "defaults": {
-      "restrict_to_workspace": false
+    "agents": {
+        "defaults": {
+            "restrict_to_workspace": false
+        }
     }
-  }
 }
 ```
 
@@ -761,15 +762,19 @@ The `message` tool supports richer output for Telegram, including media files an
 
 ```json
 {
-  "content": "Build finished. Choose next step:",
-  "attachments": [
-    {"type": "image", "url": "https://example.com/screenshot.png", "caption": "Latest result"},
-    {"type": "file", "path": "/tmp/report.pdf", "caption": "Detailed report"}
-  ],
-  "buttons": [
-    {"text": "Open Dashboard", "url": "https://example.com/dashboard", "row": 0},
-    {"text": "Deploy", "callback_data": "deploy:confirm", "row": 1}
-  ]
+    "content": "Build finished. Choose next step:",
+    "attachments": [
+        {
+            "type": "image",
+            "url": "https://example.com/screenshot.png",
+            "caption": "Latest result"
+        },
+        { "type": "file", "path": "/tmp/report.pdf", "caption": "Detailed report" }
+    ],
+    "buttons": [
+        { "text": "Open Dashboard", "url": "https://example.com/dashboard", "row": 0 },
+        { "text": "Deploy", "callback_data": "deploy:confirm", "row": 1 }
+    ]
 }
 ```
 
@@ -784,10 +789,10 @@ Notes:
 
 ```json
 {
-  "heartbeat": {
-    "enabled": true,
-    "interval": 30
-  }
+    "heartbeat": {
+        "enabled": true,
+        "interval": 30
+    }
 }
 ```
 
@@ -798,8 +803,8 @@ Notes:
 
 **Environment variables:**
 
-* `PICOCLAW_HEARTBEAT_ENABLED=false` to disable
-* `PICOCLAW_HEARTBEAT_INTERVAL=60` to change interval
+- `PICOCLAW_HEARTBEAT_ENABLED=false` to disable
+- `PICOCLAW_HEARTBEAT_INTERVAL=60` to change interval
 
 ### Providers
 
@@ -855,28 +860,28 @@ This design also enables **multi-agent support** with flexible provider selectio
 
 ```json
 {
-  "model_list": [
-    {
-      "model_name": "gpt-5.2",
-      "model": "openai/gpt-5.2",
-      "api_key": "sk-your-openai-key"
-    },
-    {
-      "model_name": "claude-sonnet-4.6",
-      "model": "anthropic/claude-sonnet-4.6",
-      "api_key": "sk-ant-your-key"
-    },
-    {
-      "model_name": "glm-4.7",
-      "model": "zhipu/glm-4.7",
-      "api_key": "your-zhipu-key"
+    "model_list": [
+        {
+            "model_name": "gpt-5.2",
+            "model": "openai/gpt-5.2",
+            "api_key": "sk-your-openai-key"
+        },
+        {
+            "model_name": "claude-sonnet-4.6",
+            "model": "anthropic/claude-sonnet-4.6",
+            "api_key": "sk-ant-your-key"
+        },
+        {
+            "model_name": "glm-4.7",
+            "model": "zhipu/glm-4.7",
+            "api_key": "your-zhipu-key"
+        }
+    ],
+    "agents": {
+        "defaults": {
+            "model": "gpt-5.2"
+        }
     }
-  ],
-  "agents": {
-    "defaults": {
-      "model": "gpt-5.2"
-    }
-  }
 }
 ```
 
@@ -886,9 +891,9 @@ This design also enables **multi-agent support** with flexible provider selectio
 
 ```json
 {
-  "model_name": "gpt-5.2",
-  "model": "openai/gpt-5.2",
-  "api_key": "sk-..."
+    "model_name": "gpt-5.2",
+    "model": "openai/gpt-5.2",
+    "api_key": "sk-..."
 }
 ```
 
@@ -896,9 +901,9 @@ This design also enables **multi-agent support** with flexible provider selectio
 
 ```json
 {
-  "model_name": "glm-4.7",
-  "model": "zhipu/glm-4.7",
-  "api_key": "your-key"
+    "model_name": "glm-4.7",
+    "model": "zhipu/glm-4.7",
+    "api_key": "your-key"
 }
 ```
 
@@ -906,9 +911,9 @@ This design also enables **multi-agent support** with flexible provider selectio
 
 ```json
 {
-  "model_name": "deepseek-chat",
-  "model": "deepseek/deepseek-chat",
-  "api_key": "sk-..."
+    "model_name": "deepseek-chat",
+    "model": "deepseek/deepseek-chat",
+    "api_key": "sk-..."
 }
 ```
 
@@ -916,9 +921,9 @@ This design also enables **multi-agent support** with flexible provider selectio
 
 ```json
 {
-  "model_name": "claude-sonnet-4.6",
-  "model": "anthropic/claude-sonnet-4.6",
-  "api_key": "sk-ant-your-key"
+    "model_name": "claude-sonnet-4.6",
+    "model": "anthropic/claude-sonnet-4.6",
+    "api_key": "sk-ant-your-key"
 }
 ```
 
@@ -928,8 +933,8 @@ This design also enables **multi-agent support** with flexible provider selectio
 
 ```json
 {
-  "model_name": "llama3",
-  "model": "ollama/llama3"
+    "model_name": "llama3",
+    "model": "ollama/llama3"
 }
 ```
 
@@ -937,10 +942,10 @@ This design also enables **multi-agent support** with flexible provider selectio
 
 ```json
 {
-  "model_name": "my-custom-model",
-  "model": "openai/custom-model",
-  "api_base": "https://my-proxy.com/v1",
-  "api_key": "sk-..."
+    "model_name": "my-custom-model",
+    "model": "openai/custom-model",
+    "api_base": "https://my-proxy.com/v1",
+    "api_key": "sk-..."
 }
 ```
 
@@ -950,20 +955,20 @@ Configure multiple endpoints for the same model name—PicoClaw will automatical
 
 ```json
 {
-  "model_list": [
-    {
-      "model_name": "gpt-5.2",
-      "model": "openai/gpt-5.2",
-      "api_base": "https://api1.example.com/v1",
-      "api_key": "sk-key1"
-    },
-    {
-      "model_name": "gpt-5.2",
-      "model": "openai/gpt-5.2",
-      "api_base": "https://api2.example.com/v1",
-      "api_key": "sk-key2"
-    }
-  ]
+    "model_list": [
+        {
+            "model_name": "gpt-5.2",
+            "model": "openai/gpt-5.2",
+            "api_base": "https://api1.example.com/v1",
+            "api_key": "sk-key1"
+        },
+        {
+            "model_name": "gpt-5.2",
+            "model": "openai/gpt-5.2",
+            "api_base": "https://api2.example.com/v1",
+            "api_key": "sk-key2"
+        }
+    ]
 }
 ```
 
@@ -975,18 +980,18 @@ The old `providers` configuration is **deprecated** but still supported for back
 
 ```json
 {
-  "providers": {
-    "zhipu": {
-      "api_key": "your-key",
-      "api_base": "https://open.bigmodel.cn/api/paas/v4"
+    "providers": {
+        "zhipu": {
+            "api_key": "your-key",
+            "api_base": "https://open.bigmodel.cn/api/paas/v4"
+        }
+    },
+    "agents": {
+        "defaults": {
+            "provider": "zhipu",
+            "model": "glm-4.7"
+        }
     }
-  },
-  "agents": {
-    "defaults": {
-      "provider": "zhipu",
-      "model": "glm-4.7"
-    }
-  }
 }
 ```
 
@@ -994,18 +999,18 @@ The old `providers` configuration is **deprecated** but still supported for back
 
 ```json
 {
-  "model_list": [
-    {
-      "model_name": "glm-4.7",
-      "model": "zhipu/glm-4.7",
-      "api_key": "your-key"
+    "model_list": [
+        {
+            "model_name": "glm-4.7",
+            "model": "zhipu/glm-4.7",
+            "api_key": "your-key"
+        }
+    ],
+    "agents": {
+        "defaults": {
+            "model": "glm-4.7"
+        }
     }
-  ],
-  "agents": {
-    "defaults": {
-      "model": "glm-4.7"
-    }
-  }
 }
 ```
 
@@ -1026,27 +1031,27 @@ This keeps the runtime lightweight while making new OpenAI-compatible backends m
 
 **1. Get API key and base URL**
 
-* Get [API key](https://bigmodel.cn/usercenter/proj-mgmt/apikeys)
+- Get [API key](https://bigmodel.cn/usercenter/proj-mgmt/apikeys)
 
 **2. Configure**
 
 ```json
 {
-  "agents": {
-    "defaults": {
-      "workspace": "~/.picoclaw/workspace",
-      "model": "glm-4.7",
-      "max_tokens": 8192,
-      "temperature": 0.7,
-      "max_tool_iterations": 20
+    "agents": {
+        "defaults": {
+            "workspace": "~/.picoclaw/workspace",
+            "model": "glm-4.7",
+            "max_tokens": 8192,
+            "temperature": 0.7,
+            "max_tool_iterations": 20
+        }
+    },
+    "providers": {
+        "zhipu": {
+            "api_key": "Your API Key",
+            "api_base": "https://open.bigmodel.cn/api/paas/v4"
+        }
     }
-  },
-  "providers": {
-    "zhipu": {
-      "api_key": "Your API Key",
-      "api_base": "https://open.bigmodel.cn/api/paas/v4"
-    }
-  }
 }
 ```
 
@@ -1063,68 +1068,68 @@ picoclaw agent -m "Hello"
 
 ```json
 {
-  "agents": {
-    "defaults": {
-      "model": "anthropic/claude-opus-4-5"
-    }
-  },
-  "providers": {
-    "openrouter": {
-      "api_key": "sk-or-v1-xxx"
+    "agents": {
+        "defaults": {
+            "model": "anthropic/claude-opus-4-5"
+        }
     },
-    "groq": {
-      "api_key": "gsk_xxx"
-    }
-  },
-  "channels": {
-    "telegram": {
-      "enabled": true,
-      "token": "123456:ABC...",
-      "allow_from": ["123456789"]
+    "providers": {
+        "openrouter": {
+            "api_key": "sk-or-v1-xxx"
+        },
+        "groq": {
+            "api_key": "gsk_xxx"
+        }
     },
-    "discord": {
-      "enabled": true,
-      "token": "",
-      "allow_from": [""]
+    "channels": {
+        "telegram": {
+            "enabled": true,
+            "token": "123456:ABC...",
+            "allow_from": ["123456789"]
+        },
+        "discord": {
+            "enabled": true,
+            "token": "",
+            "allow_from": [""]
+        },
+        "whatsapp": {
+            "enabled": false
+        },
+        "feishu": {
+            "enabled": false,
+            "app_id": "cli_xxx",
+            "app_secret": "xxx",
+            "encrypt_key": "",
+            "verification_token": "",
+            "allow_from": []
+        },
+        "qq": {
+            "enabled": false,
+            "app_id": "",
+            "app_secret": "",
+            "allow_from": []
+        }
     },
-    "whatsapp": {
-      "enabled": false
+    "tools": {
+        "web": {
+            "brave": {
+                "enabled": false,
+                "api_key": "BSA...",
+                "max_results": 5
+            },
+            "duckduckgo": {
+                "enabled": true,
+                "max_results": 5
+            }
+        },
+        "cron": {
+            "exec_timeout_minutes": 5
+        }
     },
-    "feishu": {
-      "enabled": false,
-      "app_id": "cli_xxx",
-      "app_secret": "xxx",
-      "encrypt_key": "",
-      "verification_token": "",
-      "allow_from": []
-    },
-    "qq": {
-      "enabled": false,
-      "app_id": "",
-      "app_secret": "",
-      "allow_from": []
-    }
-  },
-  "tools": {
-    "web": {
-      "brave": {
-        "enabled": false,
-        "api_key": "BSA...",
-        "max_results": 5
-      },
-      "duckduckgo": {
+    "heartbeat": {
         "enabled": true,
-        "max_results": 5
-      }
-    },
-    "cron": {
-      "exec_timeout_minutes": 5
+        "interval": 30
     }
-  },
-  "heartbeat": {
-    "enabled": true,
-    "interval": 30
-  }
 }
 ```
 
@@ -1146,9 +1151,9 @@ picoclaw agent -m "Hello"
 
 PicoClaw supports scheduled reminders and recurring tasks through the `cron` tool:
 
-* **One-time reminders**: "Remind me in 10 minutes" → triggers once after 10min
-* **Recurring tasks**: "Remind me every 2 hours" → triggers every 2 hours
-* **Cron expressions**: "Remind me at 9am daily" → uses cron expression
+- **One-time reminders**: "Remind me in 10 minutes" → triggers once after 10min
+- **Recurring tasks**: "Remind me every 2 hours" → triggers every 2 hours
+- **Cron expressions**: "Remind me at 9am daily" → uses cron expression
 
 Jobs are stored in `~/.picoclaw/workspace/cron/` and processed automatically.
 
@@ -1181,19 +1186,19 @@ Add the key to `~/.picoclaw/config.json` if using Brave:
 
 ```json
 {
-  "tools": {
-    "web": {
-      "brave": {
-        "enabled": false,
-        "api_key": "YOUR_BRAVE_API_KEY",
-        "max_results": 5
-      },
-      "duckduckgo": {
-        "enabled": true,
-        "max_results": 5
-      }
+    "tools": {
+        "web": {
+            "brave": {
+                "enabled": false,
+                "api_key": "YOUR_BRAVE_API_KEY",
+                "max_results": 5
+            },
+            "duckduckgo": {
+                "enabled": true,
+                "max_results": 5
+            }
+        }
     }
-  }
 }
 ```
 

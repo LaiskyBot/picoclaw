@@ -416,10 +416,7 @@ func (tp *TaskPipeline) BuildStatusReply(channel, chatID, senderID string) strin
 	var sb strings.Builder
 	sb.WriteString("Task status:\n")
 	for _, task := range items {
-		fmt.Fprintf(&sb, "- %s: %s", task.ID, task.Status)
-		if task.Summary != "" {
-			fmt.Fprintf(&sb, " [summary=%s]", task.Summary)
-		}
+		fmt.Fprintf(&sb, "- %s: %s", taskLabel(task), task.Status)
 		if task.Status == TaskStatusQueued {
 			if task.DispatchQueued {
 				sb.WriteString(" (ready)")
@@ -612,10 +609,7 @@ func (tp *TaskPipeline) BuildConversationStatusSummary(channel, chatID, senderID
 
 	var sb strings.Builder
 	for _, task := range tasks {
-		fmt.Fprintf(&sb, "- %s: %s", task.ID, task.Status)
-		if task.Summary != "" {
-			fmt.Fprintf(&sb, " [summary=%s]", task.Summary)
-		}
+		fmt.Fprintf(&sb, "- %s: %s", taskLabel(task), task.Status)
 		if task.Status == TaskStatusQueued {
 			if task.DispatchQueued {
 				sb.WriteString(" (ready)")
@@ -658,8 +652,8 @@ func normalizeTaskSummary(summary string) string {
 	if normalized == "" {
 		return ""
 	}
-	if len(normalized) > 96 {
-		return normalized[:93] + "..."
+	if len(normalized) > 20 {
+		return normalized[:20]
 	}
 	return normalized
 }

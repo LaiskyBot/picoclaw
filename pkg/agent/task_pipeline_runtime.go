@@ -24,6 +24,8 @@ var sensitiveTaskSummaryPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\d{6,}`),
 }
 
+var taskBriefAllowedPattern = regexp.MustCompile(`^[A-Za-z0-9 /+&,_().-]+$`)
+
 // startTaskPipelineRuntime starts background loops for task processing.
 // The ctx parameter controls lifecycle for queue worker and timeout scanner.
 // It returns no value and is a no-op when task pipeline is not initialized.
@@ -39,7 +41,7 @@ func (al *AgentLoop) startTaskPipelineRuntime(ctx context.Context) {
 			ChatID:  task.ChatID,
 			Content: fmt.Sprintf(
 				"Task %s became orphaned after restart. Please confirm whether I should retry it or mark it closed.",
-				task.ID,
+				taskLabel(task),
 			),
 		})
 	}
@@ -87,7 +89,7 @@ func (al *AgentLoop) runTaskTimeoutLoop(ctx context.Context) {
 					ChatID:  task.ChatID,
 					Content: fmt.Sprintf(
 						"Task %s timed out and may be orphaned. Reply with 'retry %s' or send a new instruction.",
-						task.ID,
+						taskLabel(task),
 						task.ID,
 					),
 				})
@@ -108,15 +110,6 @@ func (al *AgentLoop) executePlannerTask(parentCtx context.Context, task *Pipelin
 		al.taskPipeline.MarkFailed(task.ID, "Planner agent is not configured")
 		al.publishTaskFinalReport(task.ID, "", fmt.Errorf("planner agent is not configured"))
 		return
-	}
-
-	summaryCtx, summaryCancel := context.WithTimeout(parentCtx, 8*time.Second)
-	generatedSummary := al.generateTaskSummary(summaryCtx, task.Request)
-	summaryCancel()
-	if generatedSummary != "" {
-		if al.taskPipeline.UpdateSummary(task.ID, generatedSummary) {
-			task.Summary = generatedSummary
-		}
 	}
 
 	al.taskPipeline.MarkRunning(task.ID, planner.ID)
@@ -213,7 +206,7 @@ func formatTaskFinalReport(task *PipelineTask, finalStatus, summary string) stri
 
 	return fmt.Sprintf(
 		"Task %s finished.\n- status: %s\n- planner: %s\n- task_summary: %s\n- started_at_utc: %s\n- finished_at_utc: %s\n- duration: %s\n- worker_updates: %d\n- summary: %s",
-		task.ID,
+		taskLabel(task),
 		finalStatus,
 		valueOrNA(task.PlannerAgent),
 		valueOrNA(task.Summary),
@@ -283,9 +276,9 @@ func (al *AgentLoop) maybePromoteQueuedTasks() {
 	}
 }
 
-// generateTaskSummary asks planner LLM for a concise one-line task summary.
+// generateTaskSummary asks planner LLM for a concise one-line task brief.
 // The ctx parameter controls LLM call lifecycle and request carries original user input.
-// It returns a normalized short summary with fallback when model call fails.
+// It returns an English brief within 20 characters, with fallback when validation fails.
 func (al *AgentLoop) generateTaskSummary(ctx context.Context, request string) string {
 	fallback := fallbackTaskSummary()
 	planner := al.getPlannerAgent()
@@ -294,10 +287,10 @@ func (al *AgentLoop) generateTaskSummary(ctx context.Context, request string) st
 	}
 
 	resp, err := planner.Provider.Chat(ctx, []providers.Message{
-		{Role: "system", Content: "You generate concise task labels for tracking. Return one short line only. Never include secrets, tokens, URLs, emails, IDs, or long numbers."},
-		{Role: "user", Content: "Summarize this task in 4-10 words, preserve user language, no markdown, no quotes, keep it generic and descriptive:\n" + request},
+		{Role: "system", Content: "You generate concise task briefs for tracking. Output must be English, plain text, and at most 20 characters. Use only letters, numbers, spaces, and common punctuation. Never include secrets, tokens, URLs, emails, IDs, or long numbers."},
+		{Role: "user", Content: "Write a task brief for this request. Requirement: English only, <=20 characters, no markdown, no quotes, generic and descriptive:\n" + request},
 	}, nil, planner.Model, map[string]any{
-		"max_tokens":  80,
+		"max_tokens":  40,
 		"temperature": 0,
 	})
 	if err != nil || resp == nil {
@@ -305,7 +298,7 @@ func (al *AgentLoop) generateTaskSummary(ctx context.Context, request string) st
 	}
 
 	label := normalizeTaskSummary(resp.Content)
-	if label == "" || containsSensitiveTaskSummaryText(label) {
+	if !isSafeTaskBrief(label) {
 		return fallback
 	}
 	return label
@@ -316,6 +309,23 @@ func (al *AgentLoop) generateTaskSummary(ctx context.Context, request string) st
 // It returns a non-empty generic label string.
 func fallbackTaskSummary() string {
 	return "task"
+}
+
+// isSafeTaskBrief validates generated task brief for display safety and readability.
+// The summary parameter is normalized one-line text from model output.
+// It returns true when the brief is English-like, short, and free of sensitive patterns.
+func isSafeTaskBrief(summary string) bool {
+	summary = normalizeTaskSummary(summary)
+	if summary == "" || len(summary) > 20 {
+		return false
+	}
+	if !taskBriefAllowedPattern.MatchString(summary) {
+		return false
+	}
+	if containsSensitiveTaskSummaryText(summary) {
+		return false
+	}
+	return true
 }
 
 // containsSensitiveTaskSummaryText checks whether a generated label appears to expose sensitive data.
@@ -338,9 +348,9 @@ func taskLabel(task *PipelineTask) string {
 		return "n/a"
 	}
 	if task.Summary == "" {
-		return task.ID
+		return fmt.Sprintf("%s(%s)", task.ID, fallbackTaskSummary())
 	}
-	return fmt.Sprintf("%s [%s]", task.ID, task.Summary)
+	return fmt.Sprintf("%s(%s)", task.ID, task.Summary)
 }
 
 // decideTaskSchedule asks LLM whether the new task should run in parallel or wait.
@@ -552,9 +562,9 @@ func parseParallelTaskID(raw string) (string, bool) {
 }
 
 // maybeHandleTaskControlCommand handles retry commands for orphaned tasks.
-// The msg parameter is inspected against local pipeline state.
+// The ctx parameter controls optional task-brief generation and msg carries user command text.
 // It returns response text and true when command is consumed.
-func (al *AgentLoop) maybeHandleTaskControlCommand(msg bus.InboundMessage) (string, bool) {
+func (al *AgentLoop) maybeHandleTaskControlCommand(ctx context.Context, msg bus.InboundMessage) (string, bool) {
 	if al.taskPipeline == nil {
 		return "", false
 	}
@@ -592,7 +602,17 @@ func (al *AgentLoop) maybeHandleTaskControlCommand(msg bus.InboundMessage) (stri
 		return "You can only retry tasks from the current conversation.", true
 	}
 
-	newTask, err := al.taskPipeline.EnqueueTask(task.Channel, task.ChatID, task.SenderID, task.Request, task.Summary)
+	taskSummary := task.Summary
+	if strings.TrimSpace(taskSummary) == "" || taskSummary == fallbackTaskSummary() {
+		summaryCtx, summaryCancel := context.WithTimeout(ctx, 3*time.Second)
+		taskSummary = al.generateTaskSummary(summaryCtx, task.Request)
+		summaryCancel()
+		if taskSummary == "" {
+			taskSummary = fallbackTaskSummary()
+		}
+	}
+
+	newTask, err := al.taskPipeline.EnqueueTask(task.Channel, task.ChatID, task.SenderID, task.Request, taskSummary)
 	if err != nil {
 		return fmt.Sprintf("Failed to retry %s: %s", id, err.Error()), true
 	}

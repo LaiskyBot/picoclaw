@@ -350,7 +350,7 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 	}
 
 	if al.shouldDelegateToPipeline(msg.Channel) && al.taskPipeline != nil {
-		if response, handled := al.maybeHandleTaskControlCommand(msg); handled {
+		if response, handled := al.maybeHandleTaskControlCommand(ctx, msg); handled {
 			return response, nil
 		}
 
@@ -358,7 +358,12 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			return al.taskPipeline.BuildStatusReply(msg.Channel, msg.ChatID, msg.SenderID), nil
 		}
 
-		taskSummary := fallbackTaskSummary()
+		summaryCtx, summaryCancel := context.WithTimeout(ctx, 3*time.Second)
+		taskSummary := al.generateTaskSummary(summaryCtx, msg.Content)
+		summaryCancel()
+		if taskSummary == "" {
+			taskSummary = fallbackTaskSummary()
+		}
 
 		task, err := al.taskPipeline.EnqueueTaskWithScheduling(
 			msg.Channel,
@@ -380,9 +385,8 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 		}
 
 		return fmt.Sprintf(
-			"Task %s [%s] accepted. I have delegated it to the planner and will keep you updated. Send /status anytime for progress.",
-			task.ID,
-			taskSummary,
+			"Task %s accepted. I have delegated it to the planner and will keep you updated. Send /status anytime for progress.",
+			taskLabel(task),
 		), nil
 	}
 
