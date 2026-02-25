@@ -42,10 +42,10 @@ func TestTaskPipeline_PersistenceAndStatus(t *testing.T) {
 	require.Contains(t, status, TaskStatusDone)
 }
 
-// TestTaskPipeline_MarkOrphanedOnRestart verifies running tasks become orphaned after restart.
+// TestTaskPipeline_RecoverUnfinishedOnRestart verifies unfinished tasks are resumed after restart.
 // It simulates process restart by creating a new pipeline instance from persisted state.
 // It returns no value and fails test on mismatches.
-func TestTaskPipeline_MarkOrphanedOnRestart(t *testing.T) {
+func TestTaskPipeline_RecoverUnfinishedOnRestart(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "task-pipeline-orphan-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -56,14 +56,19 @@ func TestTaskPipeline_MarkOrphanedOnRestart(t *testing.T) {
 	require.True(t, tp.MarkRunning(task.ID, "planner"))
 
 	reloaded := NewTaskPipeline(tmpDir, 0)
-	orphans := reloaded.MarkOrphanedOnRestart()
-	require.Len(t, orphans, 1)
-	require.Equal(t, task.ID, orphans[0].ID)
-	require.Equal(t, TaskStatusOrphaned, orphans[0].Status)
+	recovered := reloaded.RecoverUnfinishedOnRestart()
+	require.Len(t, recovered, 1)
+	require.Equal(t, task.ID, recovered[0].ID)
+	require.Equal(t, TaskStatusQueued, recovered[0].Status)
+	require.Equal(t, "resumed after restart", recovered[0].CheckpointNote)
+	require.Zero(t, recovered[0].StartedAtUTC)
+	require.False(t, recovered[0].DispatchQueued)
 
 	restored, ok := reloaded.GetTaskByID(task.ID)
 	require.True(t, ok)
-	require.Equal(t, TaskStatusOrphaned, restored.Status)
+	require.Equal(t, TaskStatusQueued, restored.Status)
+	require.NotZero(t, restored.CheckpointAtUTC)
+	require.Equal(t, "resumed after restart", restored.CheckpointNote)
 }
 
 // TestAgentLoop_ProcessMessage_DelegatesExternalTasks verifies external messages are enqueued.

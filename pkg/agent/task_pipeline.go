@@ -50,6 +50,8 @@ type PipelineTask struct {
 	Status         string   `json:"status"`
 	CreatedAtUTC   int64    `json:"created_at_utc"`
 	UpdatedAtUTC   int64    `json:"updated_at_utc"`
+	CheckpointAtUTC int64   `json:"checkpoint_at_utc,omitempty"`
+	CheckpointNote string   `json:"checkpoint_note,omitempty"`
 	StartedAtUTC   int64    `json:"started_at_utc,omitempty"`
 	FinishedAtUTC  int64    `json:"finished_at_utc,omitempty"`
 	PlannerResult  string   `json:"planner_result,omitempty"`
@@ -153,6 +155,7 @@ func (tp *TaskPipeline) EnqueueTaskWithScheduling(
 		Status:         TaskStatusQueued,
 		CreatedAtUTC:   nowUTC,
 		UpdatedAtUTC:   nowUTC,
+		CheckpointAtUTC: nowUTC,
 	}
 	tp.tasks[taskID] = task
 	saveErr := tp.saveLocked()
@@ -226,6 +229,8 @@ func (tp *TaskPipeline) MarkRunning(taskID, plannerAgent string) bool {
 	task.PlannerAgent = plannerAgent
 	task.StartedAtUTC = nowUTC
 	task.UpdatedAtUTC = nowUTC
+	task.CheckpointAtUTC = nowUTC
+	task.CheckpointNote = "planner running"
 
 	if err := tp.saveLocked(); err != nil {
 		logger.WarnCF("agent", "Failed to persist running task", map[string]any{"task_id": taskID, "error": err.Error()})
@@ -248,6 +253,8 @@ func (tp *TaskPipeline) MarkPlannerCompleted(taskID, plannerResult string) bool 
 	task.Status = TaskStatusDone
 	task.PlannerResult = plannerResult
 	task.UpdatedAtUTC = nowUTC
+	task.CheckpointAtUTC = nowUTC
+	task.CheckpointNote = "planner completed"
 	task.FinishedAtUTC = nowUTC
 	task.Error = ""
 
@@ -272,6 +279,8 @@ func (tp *TaskPipeline) MarkFailed(taskID, errMessage string) bool {
 	task.Status = TaskStatusFailed
 	task.Error = errMessage
 	task.UpdatedAtUTC = nowUTC
+	task.CheckpointAtUTC = nowUTC
+	task.CheckpointNote = "planner failed"
 	task.FinishedAtUTC = nowUTC
 
 	if err := tp.saveLocked(); err != nil {
@@ -293,6 +302,8 @@ func (tp *TaskPipeline) AppendWorkerEvent(taskID, event string) bool {
 	}
 	task.WorkerEvents = append(task.WorkerEvents, event)
 	task.UpdatedAtUTC = time.Now().UTC().UnixMilli()
+	task.CheckpointAtUTC = task.UpdatedAtUTC
+	task.CheckpointNote = "worker update"
 
 	if err := tp.saveLocked(); err != nil {
 		logger.WarnCF("agent", "Failed to persist worker event", map[string]any{"task_id": taskID, "error": err.Error()})
@@ -318,6 +329,8 @@ func (tp *TaskPipeline) UpdateSummary(taskID, summary string) bool {
 	}
 	task.Summary = normalizedSummary
 	task.UpdatedAtUTC = time.Now().UTC().UnixMilli()
+	task.CheckpointAtUTC = task.UpdatedAtUTC
+	task.CheckpointNote = "summary updated"
 
 	if err := tp.saveLocked(); err != nil {
 		logger.WarnCF("agent", "Failed to persist task summary update", map[string]any{"task_id": taskID, "error": err.Error()})
@@ -325,7 +338,49 @@ func (tp *TaskPipeline) UpdateSummary(taskID, summary string) bool {
 	return true
 }
 
+// RecoverUnfinishedOnRestart recovers unfinished tasks after process restart.
+// It converts running/orphaned tasks back to queued state and resets in-memory dispatch flags.
+// It returns tasks that were recovered and should be resumed automatically.
+func (tp *TaskPipeline) RecoverUnfinishedOnRestart() []*PipelineTask {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+
+	recovered := make([]*PipelineTask, 0)
+	nowUTC := time.Now().UTC().UnixMilli()
+	for _, task := range tp.tasks {
+		switch task.Status {
+		case TaskStatusQueued:
+			task.DispatchQueued = false
+			task.UpdatedAtUTC = nowUTC
+			task.CheckpointAtUTC = nowUTC
+			task.CheckpointNote = "resumed after restart"
+			recovered = append(recovered, clonePipelineTask(task))
+		case TaskStatusRunning, TaskStatusOrphaned:
+			task.Status = TaskStatusQueued
+			task.DispatchQueued = false
+			task.PlannerAgent = ""
+			task.StartedAtUTC = 0
+			task.FinishedAtUTC = 0
+			task.Error = "Recovered after process restart; resuming execution."
+			task.UpdatedAtUTC = nowUTC
+			task.CheckpointAtUTC = nowUTC
+			task.CheckpointNote = "resumed after restart"
+			recovered = append(recovered, clonePipelineTask(task))
+		}
+	}
+
+	if len(recovered) > 0 {
+		if err := tp.saveLocked(); err != nil {
+			logger.WarnCF("agent", "Failed to persist recovered tasks", map[string]any{"error": err.Error()})
+		}
+	}
+
+	sort.Slice(recovered, func(i, j int) bool { return recovered[i].CreatedAtUTC < recovered[j].CreatedAtUTC })
+	return recovered
+}
+
 // MarkOrphanedOnRestart marks queued/running tasks as orphaned after restart.
+// The method is retained for compatibility with legacy callers.
 // It returns the list of tasks transitioned to orphaned state for user notification.
 func (tp *TaskPipeline) MarkOrphanedOnRestart() []*PipelineTask {
 	tp.mu.Lock()
@@ -338,6 +393,8 @@ func (tp *TaskPipeline) MarkOrphanedOnRestart() []*PipelineTask {
 			task.Status = TaskStatusOrphaned
 			task.Error = "Tracking was interrupted by process restart."
 			task.UpdatedAtUTC = nowUTC
+			task.CheckpointAtUTC = nowUTC
+			task.CheckpointNote = "orphaned after restart"
 			task.FinishedAtUTC = nowUTC
 			orphans = append(orphans, clonePipelineTask(task))
 		}
@@ -351,6 +408,28 @@ func (tp *TaskPipeline) MarkOrphanedOnRestart() []*PipelineTask {
 
 	sort.Slice(orphans, func(i, j int) bool { return orphans[i].CreatedAtUTC < orphans[j].CreatedAtUTC })
 	return orphans
+}
+
+// CheckpointTask updates task heartbeat metadata for restart recovery and timeout tracking.
+// The taskID parameter identifies the task and note is a concise checkpoint description.
+// It returns true when task exists and checkpoint is persisted.
+func (tp *TaskPipeline) CheckpointTask(taskID, note string) bool {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+
+	task, ok := tp.tasks[taskID]
+	if !ok {
+		return false
+	}
+	nowUTC := time.Now().UTC().UnixMilli()
+	task.UpdatedAtUTC = nowUTC
+	task.CheckpointAtUTC = nowUTC
+	task.CheckpointNote = strings.TrimSpace(note)
+
+	if err := tp.saveLocked(); err != nil {
+		logger.WarnCF("agent", "Failed to persist task checkpoint", map[string]any{"task_id": taskID, "error": err.Error()})
+	}
+	return true
 }
 
 // MarkTimeouts marks long-running tasks as timeout state.
@@ -373,6 +452,8 @@ func (tp *TaskPipeline) MarkTimeouts(now time.Time) []*PipelineTask {
 		task.Status = TaskStatusTimeout
 		task.Error = fmt.Sprintf("Task exceeded timeout of %s.", tp.timeout)
 		task.UpdatedAtUTC = nowUTC
+		task.CheckpointAtUTC = nowUTC
+		task.CheckpointNote = "timeout"
 		task.FinishedAtUTC = nowUTC
 		timedOut = append(timedOut, clonePipelineTask(task))
 	}
@@ -586,6 +667,8 @@ func (tp *TaskPipeline) ForceParallelDispatch(taskID string) (*PipelineTask, boo
 	task.WaitForTaskID = nil
 	task.DispatchQueued = true
 	task.UpdatedAtUTC = time.Now().UTC().UnixMilli()
+	task.CheckpointAtUTC = task.UpdatedAtUTC
+	task.CheckpointNote = "forced parallel dispatch"
 	if err := tp.saveLocked(); err != nil {
 		tp.mu.Unlock()
 		return nil, false, err

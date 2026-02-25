@@ -192,6 +192,7 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 	al.running.Store(true)
 	logger.InfoC("agent", "Agent loop started")
 	al.startTaskPipelineRuntime(ctx)
+	al.resumeSubagentTasks(ctx)
 
 	for al.running.Load() {
 		select {
@@ -236,6 +237,32 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 	logger.InfoC("agent", "Agent loop stopped")
 
 	return nil
+}
+
+// resumeSubagentTasks resumes persisted unfinished subagent jobs for all registered agents.
+// The ctx parameter controls the lifecycle of resumed jobs.
+// It returns no value and logs aggregated resume count.
+func (al *AgentLoop) resumeSubagentTasks(ctx context.Context) {
+	resumedTotal := 0
+	for _, agentID := range al.registry.ListAgentIDs() {
+		agent, ok := al.registry.GetAgent(agentID)
+		if !ok || agent == nil {
+			continue
+		}
+		tool, ok := agent.Tools.Get("spawn")
+		if !ok {
+			continue
+		}
+		spawnTool, ok := tool.(*tools.SpawnTool)
+		if !ok {
+			continue
+		}
+		resumedTotal += spawnTool.ResumeUnfinished(ctx)
+	}
+
+	if resumedTotal > 0 {
+		logger.InfoCF("agent", "Resumed unfinished subagent tasks after restart", map[string]any{"count": resumedTotal})
+	}
 }
 
 func (al *AgentLoop) Stop() {

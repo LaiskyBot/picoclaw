@@ -65,6 +65,16 @@ func (t *SpawnTool) SetAllowlistChecker(check func(targetAgentID string) bool) {
 	t.allowlistCheck = check
 }
 
+// ResumeUnfinished resumes persisted unfinished subagent tasks after restart.
+// The ctx parameter controls resumed task lifecycles.
+// It returns how many tasks were resumed.
+func (t *SpawnTool) ResumeUnfinished(ctx context.Context) int {
+	if t.manager == nil {
+		return 0
+	}
+	return t.manager.ResumeUnfinished(ctx, t.callback)
+}
+
 func (t *SpawnTool) Execute(ctx context.Context, args map[string]any) *ToolResult {
 	task, ok := args["task"].(string)
 	if !ok || strings.TrimSpace(task) == "" {

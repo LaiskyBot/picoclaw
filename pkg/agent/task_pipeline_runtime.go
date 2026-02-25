@@ -36,13 +36,13 @@ func (al *AgentLoop) startTaskPipelineRuntime(ctx context.Context) {
 		return
 	}
 
-	orphaned := al.taskPipeline.MarkOrphanedOnRestart()
-	for _, task := range orphaned {
+	recovered := al.taskPipeline.RecoverUnfinishedOnRestart()
+	for _, task := range recovered {
 		al.bus.PublishOutbound(bus.OutboundMessage{
 			Channel: task.Channel,
 			ChatID:  task.ChatID,
 			Content: fmt.Sprintf(
-				"Task %s became orphaned after restart. Please confirm whether I should retry it or mark it closed.",
+				"Task %s was recovered after restart and is queued to resume automatically.",
 				taskLabel(task),
 			),
 		})
@@ -115,6 +115,7 @@ func (al *AgentLoop) executePlannerTask(parentCtx context.Context, task *Pipelin
 	}
 
 	al.taskPipeline.MarkRunning(task.ID, planner.ID)
+	al.taskPipeline.CheckpointTask(task.ID, "planner run started")
 	al.bus.PublishOutbound(bus.OutboundMessage{
 		Channel: task.Channel,
 		ChatID:  task.ChatID,
@@ -123,6 +124,23 @@ func (al *AgentLoop) executePlannerTask(parentCtx context.Context, task *Pipelin
 
 	runCtx, cancel := context.WithTimeout(parentCtx, 40*time.Minute)
 	defer cancel()
+
+	heartbeatDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-heartbeatDone:
+				return
+			case <-ticker.C:
+				al.taskPipeline.CheckpointTask(task.ID, "planner run heartbeat")
+			}
+		}
+	}()
+	defer close(heartbeatDone)
 
 	plannerPrompt := buildPlannerDelegationPrompt(task)
 	sessionKey := fmt.Sprintf("agent:%s:pipeline:%s", planner.ID, task.ID)
@@ -139,11 +157,13 @@ func (al *AgentLoop) executePlannerTask(parentCtx context.Context, task *Pipelin
 	})
 	if err != nil {
 		al.taskPipeline.MarkFailed(task.ID, err.Error())
+		al.taskPipeline.CheckpointTask(task.ID, "planner run failed")
 		al.publishTaskFinalReport(task.ID, "", err)
 		return
 	}
 
 	al.taskPipeline.MarkPlannerCompleted(task.ID, result)
+	al.taskPipeline.CheckpointTask(task.ID, "planner run completed")
 	al.publishTaskFinalReport(task.ID, result, nil)
 }
 
