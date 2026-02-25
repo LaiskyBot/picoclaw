@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/providers"
@@ -17,7 +19,7 @@ const plannerTaskChannel = "planner_task"
 
 const plannerEmptySummaryText = "Planner completed with no textual output."
 
-const taskBriefMaxLength = 48
+const taskBriefMaxRunes = 24
 
 var sensitiveTaskSummaryPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)https?://`),
@@ -25,8 +27,6 @@ var sensitiveTaskSummaryPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\b(sk|xoxb|xapp|ghp|gho|ghu|ghs|eyj)[-_a-z0-9]{8,}\b`),
 	regexp.MustCompile(`\d{6,}`),
 }
-
-var taskBriefAllowedPattern = regexp.MustCompile(`^[A-Za-z0-9 /+&,_().-]+$`)
 
 // startTaskPipelineRuntime starts background loops for task processing.
 // The ctx parameter controls lifecycle for queue worker and timeout scanner.
@@ -280,17 +280,17 @@ func (al *AgentLoop) maybePromoteQueuedTasks() {
 
 // generateTaskSummary asks planner LLM for a concise one-line task brief.
 // The ctx parameter controls LLM call lifecycle and request carries original user input.
-// It returns an English brief within 20 characters, with fallback when validation fails.
+// It returns a language-preserving brief, with fallback derived from user request.
 func (al *AgentLoop) generateTaskSummary(ctx context.Context, request string) string {
-	fallback := fallbackTaskSummary()
+	fallback := fallbackTaskSummaryFromRequest(request)
 	planner := al.getPlannerAgent()
 	if planner == nil || planner.Provider == nil {
 		return fallback
 	}
 
 	resp, err := planner.Provider.Chat(ctx, []providers.Message{
-		{Role: "system", Content: "You generate concise task briefs for tracking. Output must be English, plain text, and at most 48 characters. Use only letters, numbers, spaces, and common punctuation. Never include secrets, tokens, URLs, emails, IDs, or long numbers."},
-		{Role: "user", Content: "Write a task brief for this request. Requirement: English only, <=48 characters, no markdown, no quotes, generic and descriptive:\n" + request},
+		{Role: "system", Content: "You generate concise task briefs for tracking. Keep the same language as the user request. Output must be plain text only, no markdown, no quotes, no secrets, no URLs, no emails, no tokens, and no long numbers."},
+		{Role: "user", Content: "Write a very short task brief for this request. Keep the user's language and summarize the goal in <= 24 characters:\n" + request},
 	}, nil, planner.Model, map[string]any{
 		"max_tokens":  64,
 		"temperature": 0,
@@ -306,11 +306,18 @@ func (al *AgentLoop) generateTaskSummary(ctx context.Context, request string) st
 	return label
 }
 
-// fallbackTaskSummary returns a stable generic summary when planner label generation fails.
-// It takes no parameters and intentionally avoids user content to reduce leakage risk.
-// It returns a non-empty generic label string.
-func fallbackTaskSummary() string {
-	return "user request"
+// fallbackTaskSummaryFromRequest derives a compact brief directly from user request text.
+// The request parameter contains original user input and may include multiple lines.
+// It returns a concise, language-preserving fallback summary for display.
+func fallbackTaskSummaryFromRequest(request string) string {
+	clean := sanitizeTaskSummary(request)
+	if clean == "" {
+		return "request"
+	}
+	if containsSensitiveTaskSummaryText(clean) {
+		return "request"
+	}
+	return truncateRunes(clean, taskBriefMaxRunes)
 }
 
 // sanitizeTaskSummary normalizes and cleans model-generated task brief text.
@@ -326,19 +333,43 @@ func sanitizeTaskSummary(summary string) string {
 
 	var sb strings.Builder
 	for _, r := range clean {
-		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+		if isAllowedTaskBriefRune(r) {
 			sb.WriteRune(r)
 			continue
 		}
-		switch r {
-		case ' ', '/', '+', '&', ',', '_', '(', ')', '.', '-':
-			sb.WriteRune(r)
-		default:
-			sb.WriteRune(' ')
-		}
+		sb.WriteRune(' ')
 	}
 
 	return normalizeTaskSummary(sb.String())
+}
+
+// isAllowedTaskBriefRune reports whether a rune is safe and readable in task brief text.
+// The r parameter is a single Unicode code point from model output.
+// It returns true for letters, numbers, spaces, and selected punctuation.
+func isAllowedTaskBriefRune(r rune) bool {
+	if unicode.IsLetter(r) || unicode.IsNumber(r) || unicode.IsSpace(r) {
+		return true
+	}
+	switch r {
+	case '/', '+', '&', ',', '_', '(', ')', '.', '-', ':', '，', '。', '、', '：', '；', '！', '？':
+		return true
+	default:
+		return false
+	}
+}
+
+// truncateRunes truncates a string by rune count and preserves UTF-8 validity.
+// The text parameter is the original string and maxRunes is the inclusive limit.
+// It returns the original text when within limit, otherwise a rune-truncated prefix.
+func truncateRunes(text string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(text) <= maxRunes {
+		return text
+	}
+	runes := []rune(text)
+	return string(runes[:maxRunes])
 }
 
 // isSafeTaskBrief validates generated task brief for display safety and readability.
@@ -351,10 +382,7 @@ func isSafeTaskBrief(summary string) bool {
 	}
 
 	summary = sanitizeTaskSummary(summary)
-	if summary == "" || len(summary) > taskBriefMaxLength {
-		return false
-	}
-	if !taskBriefAllowedPattern.MatchString(summary) {
+	if summary == "" || utf8.RuneCountInString(summary) > taskBriefMaxRunes {
 		return false
 	}
 	if containsSensitiveTaskSummaryText(summary) {
@@ -383,7 +411,7 @@ func taskLabel(task *PipelineTask) string {
 		return "n/a"
 	}
 	if task.Summary == "" {
-		return fmt.Sprintf("%s(%s)", task.ID, fallbackTaskSummary())
+		return fmt.Sprintf("%s(%s)", task.ID, fallbackTaskSummaryFromRequest(task.Request))
 	}
 	return fmt.Sprintf("%s(%s)", task.ID, task.Summary)
 }
@@ -638,12 +666,12 @@ func (al *AgentLoop) maybeHandleTaskControlCommand(ctx context.Context, msg bus.
 	}
 
 	taskSummary := task.Summary
-	if strings.TrimSpace(taskSummary) == "" || taskSummary == fallbackTaskSummary() {
+	if strings.TrimSpace(taskSummary) == "" || taskSummary == fallbackTaskSummaryFromRequest(task.Request) {
 		summaryCtx, summaryCancel := context.WithTimeout(ctx, 12*time.Second)
 		taskSummary = al.generateTaskSummary(summaryCtx, task.Request)
 		summaryCancel()
 		if taskSummary == "" {
-			taskSummary = fallbackTaskSummary()
+			taskSummary = fallbackTaskSummaryFromRequest(task.Request)
 		}
 	}
 

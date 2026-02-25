@@ -239,10 +239,13 @@ func TestTaskPipeline_NextSequenceForDateLocked(t *testing.T) {
 // It returns no value and fails test on unexpected normalized content.
 func TestSanitizeTaskSummary(t *testing.T) {
 	clean := sanitizeTaskSummary("  `Investigate: telegram timeout #123`  ")
-	require.Equal(t, "Investigate telegram timeout 123", clean)
+	require.Equal(t, "Investigate: telegram ti", clean)
 
 	clean = sanitizeTaskSummary("\nfix   queue\tdeadlock\n")
 	require.Equal(t, "fix queue deadlock", clean)
+
+	clean = sanitizeTaskSummary("用户截图")
+	require.Equal(t, "用户截图", clean)
 }
 
 // TestIsSafeTaskBrief verifies safety validator accepts clean labels and rejects sensitive/invalid content.
@@ -250,6 +253,42 @@ func TestSanitizeTaskSummary(t *testing.T) {
 // It returns no value and fails test on incorrect validation result.
 func TestIsSafeTaskBrief(t *testing.T) {
 	require.True(t, isSafeTaskBrief("Investigate queue deadlock"))
+	require.True(t, isSafeTaskBrief("查询天气"))
 	require.False(t, isSafeTaskBrief("https://example.com/reset"))
 	require.False(t, isSafeTaskBrief("ticket 123456789"))
+}
+
+// TestFallbackTaskSummaryFromRequest verifies fallback summary keeps user language and intent.
+// It passes multilingual requests and checks concise labels are derived from request text.
+// It returns no value and fails test on unexpected fallback output.
+func TestFallbackTaskSummaryFromRequest(t *testing.T) {
+	brief := fallbackTaskSummaryFromRequest("帮我查询天气")
+	require.Equal(t, "帮我查询天气", brief)
+
+	brief = fallbackTaskSummaryFromRequest("Please take a screenshot of the dashboard and send it")
+	require.Equal(t, "Please take a screenshot", brief)
+}
+
+// TestTaskPipeline_BuildStatusReplyIncludesTiming verifies status output includes start and elapsed/duration info.
+// It checks running tasks expose started_at_utc and elapsed, and completed tasks expose duration.
+// It returns no value and fails test on missing timing fields.
+func TestTaskPipeline_BuildStatusReplyIncludesTiming(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "task-pipeline-status-timing-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	tp := NewTaskPipeline(tmpDir, 0)
+	task, err := tp.EnqueueTask("telegram", "chat-3", "user-3", "查询天气", "查询天气")
+	require.NoError(t, err)
+	require.True(t, tp.MarkRunning(task.ID, "planner"))
+
+	running := tp.BuildStatusReply("telegram", "chat-3", "user-3")
+	require.Contains(t, running, "started_at_utc=")
+	require.Contains(t, running, "elapsed=")
+
+	time.Sleep(10 * time.Millisecond)
+	require.True(t, tp.MarkPlannerCompleted(task.ID, "done"))
+	completed := tp.BuildStatusReply("telegram", "chat-3", "user-3")
+	require.Contains(t, completed, "started_at_utc=")
+	require.Contains(t, completed, "duration=")
 }

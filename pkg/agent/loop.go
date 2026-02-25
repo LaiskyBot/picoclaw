@@ -362,7 +362,7 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 		taskSummary := al.generateTaskSummary(summaryCtx, msg.Content)
 		summaryCancel()
 		if taskSummary == "" {
-			taskSummary = fallbackTaskSummary()
+			taskSummary = fallbackTaskSummaryFromRequest(msg.Content)
 		}
 
 		task, err := al.taskPipeline.EnqueueTaskWithScheduling(

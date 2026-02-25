@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sipeed/picoclaw/pkg/logger"
 )
@@ -439,6 +440,19 @@ func (tp *TaskPipeline) BuildStatusReply(channel, chatID, senderID string) strin
 		if task.Error != "" {
 			fmt.Fprintf(&sb, " error=%s", task.Error)
 		}
+		if task.StartedAtUTC > 0 {
+			fmt.Fprintf(&sb, " (started_at_utc=%s)", formatUnixMilliUTC(task.StartedAtUTC))
+			if task.Status == TaskStatusRunning {
+				elapsed := time.Since(time.UnixMilli(task.StartedAtUTC).UTC()).Round(time.Second)
+				if elapsed < 0 {
+					elapsed = 0
+				}
+				fmt.Fprintf(&sb, " (elapsed=%s)", elapsed.String())
+			} else if task.FinishedAtUTC > 0 && task.FinishedAtUTC >= task.StartedAtUTC {
+				duration := (time.Duration(task.FinishedAtUTC-task.StartedAtUTC) * time.Millisecond).Round(time.Second)
+				fmt.Fprintf(&sb, " (duration=%s)", duration.String())
+			}
+		}
 		sb.WriteString("\n")
 	}
 
@@ -652,8 +666,8 @@ func normalizeTaskSummary(summary string) string {
 	if normalized == "" {
 		return ""
 	}
-	if len(normalized) > taskBriefMaxLength {
-		return normalized[:taskBriefMaxLength]
+	if utf8.RuneCountInString(normalized) > taskBriefMaxRunes {
+		return truncateRunes(normalized, taskBriefMaxRunes)
 	}
 	return normalized
 }
