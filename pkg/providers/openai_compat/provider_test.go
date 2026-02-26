@@ -10,11 +10,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestProviderChat_UsesMaxCompletionTokensForGLM(t *testing.T) {
+func TestProviderChat_UsesMaxOutputTokens(t *testing.T) {
 	var requestBody map[string]any
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/chat/completions" {
+		if r.URL.Path != "/responses" {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -23,10 +23,13 @@ func TestProviderChat_UsesMaxCompletionTokensForGLM(t *testing.T) {
 			return
 		}
 		resp := map[string]any{
-			"choices": []map[string]any{
+			"status": "completed",
+			"output": []map[string]any{
 				{
-					"message":       map[string]any{"content": "ok"},
-					"finish_reason": "stop",
+					"type": "message",
+					"content": []map[string]any{
+						{"type": "output_text", "text": "ok"},
+					},
 				},
 			},
 		}
@@ -40,46 +43,37 @@ func TestProviderChat_UsesMaxCompletionTokensForGLM(t *testing.T) {
 		t.Context(),
 		[]Message{{Role: "user", Content: "hi"}},
 		nil,
-		"glm-4.7",
+		"gpt-5-mini",
 		map[string]any{"max_tokens": 1234},
 	)
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
 	}
 
-	if _, ok := requestBody["max_completion_tokens"]; !ok {
-		t.Fatalf("expected max_completion_tokens in request body")
+	if _, ok := requestBody["max_output_tokens"]; !ok {
+		t.Fatalf("expected max_output_tokens in request body")
 	}
 	if _, ok := requestBody["max_tokens"]; ok {
-		t.Fatalf("did not expect max_tokens key for glm model")
+		t.Fatalf("did not expect max_tokens key in responses request")
 	}
 }
 
 func TestProviderChat_ParsesToolCalls(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := map[string]any{
-			"choices": []map[string]any{
+			"status": "completed",
+			"output": []map[string]any{
 				{
-					"message": map[string]any{
-						"content": "",
-						"tool_calls": []map[string]any{
-							{
-								"id":   "call_1",
-								"type": "function",
-								"function": map[string]any{
-									"name":      "get_weather",
-									"arguments": "{\"city\":\"SF\"}",
-								},
-							},
-						},
-					},
-					"finish_reason": "tool_calls",
+					"type":      "function_call",
+					"call_id":   "call_1",
+					"name":      "get_weather",
+					"arguments": "{\"city\":\"SF\"}",
 				},
 			},
 			"usage": map[string]any{
-				"prompt_tokens":     10,
-				"completion_tokens": 5,
-				"total_tokens":      15,
+				"input_tokens":  10,
+				"output_tokens": 5,
+				"total_tokens":  15,
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -106,23 +100,25 @@ func TestProviderChat_ParsesToolCalls(t *testing.T) {
 func TestProviderChat_ParsesReasoningContent(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := map[string]any{
-			"choices": []map[string]any{
+			"status": "completed",
+			"output": []map[string]any{
 				{
-					"message": map[string]any{
-						"content":           "The answer is 2",
-						"reasoning_content": "Let me think step by step... 1+1=2",
-						"tool_calls": []map[string]any{
-							{
-								"id":   "call_1",
-								"type": "function",
-								"function": map[string]any{
-									"name":      "calculator",
-									"arguments": "{\"expr\":\"1+1\"}",
-								},
-							},
-						},
+					"type": "message",
+					"content": []map[string]any{
+						{"type": "output_text", "text": "The answer is 2"},
 					},
-					"finish_reason": "tool_calls",
+				},
+				{
+					"type": "reasoning",
+					"summary": []map[string]any{
+						{"type": "summary_text", "text": "Let me think step by step... 1+1=2"},
+					},
+				},
+				{
+					"type":      "function_call",
+					"call_id":   "call_1",
+					"name":      "calculator",
+					"arguments": "{\"expr\":\"1+1\"}",
 				},
 			},
 		}
@@ -169,10 +165,13 @@ func TestProviderChat_StripsMoonshotPrefixAndNormalizesKimiTemperature(t *testin
 			return
 		}
 		resp := map[string]any{
-			"choices": []map[string]any{
+			"status": "completed",
+			"output": []map[string]any{
 				{
-					"message":       map[string]any{"content": "ok"},
-					"finish_reason": "stop",
+					"type": "message",
+					"content": []map[string]any{
+						{"type": "output_text", "text": "ok"},
+					},
 				},
 			},
 		}
@@ -234,10 +233,13 @@ func TestProviderChat_StripsGroqAndOllamaPrefixes(t *testing.T) {
 					return
 				}
 				resp := map[string]any{
-					"choices": []map[string]any{
+						"status": "completed",
+						"output": []map[string]any{
 						{
-							"message":       map[string]any{"content": "ok"},
-							"finish_reason": "stop",
+								"type": "message",
+								"content": []map[string]any{
+									{"type": "output_text", "text": "ok"},
+								},
 						},
 					},
 				}
@@ -287,10 +289,13 @@ func TestProviderChat_AcceptsNumericOptionTypes(t *testing.T) {
 			return
 		}
 		resp := map[string]any{
-			"choices": []map[string]any{
+			"status": "completed",
+			"output": []map[string]any{
 				{
-					"message":       map[string]any{"content": "ok"},
-					"finish_reason": "stop",
+					"type": "message",
+					"content": []map[string]any{
+						{"type": "output_text", "text": "ok"},
+					},
 				},
 			},
 		}
@@ -311,12 +316,138 @@ func TestProviderChat_AcceptsNumericOptionTypes(t *testing.T) {
 		t.Fatalf("Chat() error = %v", err)
 	}
 
-	if requestBody["max_tokens"] != float64(512) {
-		t.Fatalf("max_tokens = %v, want 512", requestBody["max_tokens"])
+	if requestBody["max_output_tokens"] != float64(512) {
+		t.Fatalf("max_output_tokens = %v, want 512", requestBody["max_output_tokens"])
 	}
 	if requestBody["temperature"] != float64(1) {
 		t.Fatalf("temperature = %v, want 1", requestBody["temperature"])
 	}
+}
+
+func TestProviderChat_BuildsResponsesInputAndTools(t *testing.T) {
+	var requestBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/responses", r.URL.Path)
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&requestBody))
+
+		resp := map[string]any{
+			"status": "completed",
+			"output": []map[string]any{
+				{
+					"type": "message",
+					"content": []map[string]any{
+						{"type": "output_text", "text": "ok"},
+					},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	p := NewProvider("key", server.URL, "")
+	_, err := p.Chat(
+		t.Context(),
+		[]Message{
+			{Role: "system", Content: "sys rule"},
+			{Role: "user", Content: "what time is it"},
+			{
+				Role:    "assistant",
+				Content: "calling tool",
+				ToolCalls: []ToolCall{
+					{ID: "call_1", Name: "get_time", Arguments: map[string]any{"tz": "UTC"}},
+				},
+			},
+			{Role: "tool", ToolCallID: "call_1", Content: "2026-02-25T00:00:00Z"},
+		},
+		[]ToolDefinition{
+			{
+				Type: "function",
+				Function: ToolFunctionDefinition{
+					Name:        "get_time",
+					Description: "Get time by timezone",
+					Parameters: map[string]any{
+						"type": "object",
+					},
+				},
+			},
+		},
+		"gpt-5-mini",
+		map[string]any{"max_tokens": 64},
+	)
+	require.NoError(t, err)
+
+	require.Equal(t, "gpt-5-mini", requestBody["model"])
+	require.Equal(t, float64(64), requestBody["max_output_tokens"])
+	require.Equal(t, "auto", requestBody["tool_choice"])
+
+	inputItems, ok := requestBody["input"].([]any)
+	require.True(t, ok)
+	require.Len(t, inputItems, 5)
+
+	systemItem, ok := inputItems[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "message", systemItem["type"])
+	require.Equal(t, "developer", systemItem["role"])
+
+	toolCallItem, ok := inputItems[3].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "function_call", toolCallItem["type"])
+	require.Equal(t, "call_1", toolCallItem["call_id"])
+	require.Equal(t, "get_time", toolCallItem["name"])
+	require.Equal(t, `{"tz":"UTC"}`, toolCallItem["arguments"])
+
+	toolOutputItem, ok := inputItems[4].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "function_call_output", toolOutputItem["type"])
+	require.Equal(t, "call_1", toolOutputItem["call_id"])
+	require.Equal(t, "2026-02-25T00:00:00Z", toolOutputItem["output"])
+
+	tools, ok := requestBody["tools"].([]any)
+	require.True(t, ok)
+	require.Len(t, tools, 1)
+	toolDef, ok := tools[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "function", toolDef["type"])
+	require.Equal(t, "get_time", toolDef["name"])
+	require.Equal(t, "Get time by timezone", toolDef["description"])
+}
+
+func TestProviderChat_ParsesMessageOutputAndUsage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := map[string]any{
+			"status": "completed",
+			"output": []map[string]any{
+				{
+					"type": "message",
+					"content": []map[string]any{
+						{"type": "output_text", "text": "hello"},
+						{"type": "text", "text": " world"},
+					},
+				},
+			},
+			"usage": map[string]any{
+				"input_tokens":  12,
+				"output_tokens": 7,
+				"total_tokens":  19,
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	p := NewProvider("key", server.URL, "")
+	out, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "hi"}}, nil, "gpt-4.1", nil)
+	require.NoError(t, err)
+	require.Equal(t, "hello world", out.Content)
+	require.Equal(t, "stop", out.FinishReason)
+	require.NotNil(t, out.Usage)
+	require.Equal(t, 12, out.Usage.PromptTokens)
+	require.Equal(t, 7, out.Usage.CompletionTokens)
+	require.Equal(t, 19, out.Usage.TotalTokens)
 }
 
 func TestNormalizeModel_UsesAPIBase(t *testing.T) {
@@ -341,7 +472,7 @@ func TestProviderChat_HTTPErrorIncludesURLModelAndRequestID(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "API request failed:")
 	require.Contains(t, err.Error(), "Status: 522")
-	require.Contains(t, err.Error(), "URL:    "+server.URL+"/chat/completions")
+	require.Contains(t, err.Error(), "URL:    "+server.URL+"/responses")
 	require.Contains(t, err.Error(), "Model:  gpt-4o")
 	require.Contains(t, err.Error(), "Body:   error code: 522")
 	require.Contains(t, err.Error(), "RequestID: req-123")
@@ -364,9 +495,9 @@ func TestProviderChat_HTTPErrorIncludesStructuredEndpointError(t *testing.T) {
 }
 
 func TestSanitizedURL_RemovesSensitiveParts(t *testing.T) {
-	u, err := url.Parse("https://user:pass@example.com/v1/chat/completions?api_key=secret#frag")
+	u, err := url.Parse("https://user:pass@example.com/v1/responses?api_key=secret#frag")
 	require.NoError(t, err)
-	require.Equal(t, "https://example.com/v1/chat/completions", sanitizedURL(u))
+	require.Equal(t, "https://example.com/v1/responses", sanitizedURL(u))
 }
 
 func TestSummarizeBody_SingleLineAndTruncate(t *testing.T) {

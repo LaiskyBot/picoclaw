@@ -77,29 +77,17 @@ func (p *Provider) Chat(
 	model = normalizeModel(model, p.apiBase)
 
 	requestBody := map[string]any{
-		"model":    model,
-		"messages": stripSystemParts(messages),
+		"model": model,
+		"input": buildResponseInput(messages),
 	}
 
 	if len(tools) > 0 {
-		requestBody["tools"] = tools
+		requestBody["tools"] = toResponseTools(tools)
 		requestBody["tool_choice"] = "auto"
 	}
 
 	if maxTokens, ok := asInt(options["max_tokens"]); ok {
-		// Use configured maxTokensField if specified, otherwise fallback to model-based detection
-		fieldName := p.maxTokensField
-		if fieldName == "" {
-			// Fallback: detect from model name for backward compatibility
-			lowerModel := strings.ToLower(model)
-			if strings.Contains(lowerModel, "glm") || strings.Contains(lowerModel, "o1") ||
-				strings.Contains(lowerModel, "gpt-5") {
-				fieldName = "max_completion_tokens"
-			} else {
-				fieldName = "max_tokens"
-			}
-		}
-		requestBody[fieldName] = maxTokens
+		requestBody["max_output_tokens"] = maxTokens
 	}
 
 	if temperature, ok := asFloat(options["temperature"]); ok {
@@ -125,7 +113,7 @@ func (p *Provider) Chat(
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", p.apiBase+"/chat/completions", bytes.NewReader(jsonData))
+	req, err := http.NewRequestWithContext(ctx, "POST", p.apiBase+"/responses", bytes.NewReader(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -136,7 +124,7 @@ func (p *Provider) Chat(
 	}
 
 	requestURL := sanitizedURL(req.URL)
-	logger.DebugCF("openai_compat", "Sending chat completion request", map[string]any{
+	logger.DebugCF("openai_compat", "Sending responses request", map[string]any{
 		"url":           requestURL,
 		"model":         model,
 		"messages":      len(messages),
@@ -148,7 +136,7 @@ func (p *Provider) Chat(
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		logger.DebugCF("openai_compat", "Chat completion request failed before response", map[string]any{
+		logger.DebugCF("openai_compat", "Responses request failed before response", map[string]any{
 			"url":        requestURL,
 			"model":      model,
 			"latency_ms": time.Since(start).Milliseconds(),
@@ -172,7 +160,7 @@ func (p *Provider) Chat(
 		bodyPreview := summarizeBody(body, 2000)
 		endpointError := summarizeEndpointError(body, 500)
 
-		logger.DebugCF("openai_compat", "Chat completion non-200 response", map[string]any{
+		logger.DebugCF("openai_compat", "Responses non-200 response", map[string]any{
 			"url":            requestURL,
 			"model":          model,
 			"status_code":    resp.StatusCode,
@@ -199,114 +187,216 @@ func (p *Provider) Chat(
 
 func parseResponse(body []byte) (*LLMResponse, error) {
 	var apiResponse struct {
-		Choices []struct {
-			Message struct {
-				Content          string `json:"content"`
-				ReasoningContent string `json:"reasoning_content"`
-				ToolCalls        []struct {
-					ID       string `json:"id"`
-					Type     string `json:"type"`
-					Function *struct {
-						Name      string `json:"name"`
-						Arguments string `json:"arguments"`
-					} `json:"function"`
-					ExtraContent *struct {
-						Google *struct {
-							ThoughtSignature string `json:"thought_signature"`
-						} `json:"google"`
-					} `json:"extra_content"`
-				} `json:"tool_calls"`
-			} `json:"message"`
-			FinishReason string `json:"finish_reason"`
-		} `json:"choices"`
-		Usage *UsageInfo `json:"usage"`
+		Status string `json:"status"`
+		Output []struct {
+			Type      string `json:"type"`
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+			CallID    string `json:"call_id"`
+			Content   []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+			Summary []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"summary"`
+		} `json:"output"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			InputTokens      int `json:"input_tokens"`
+			OutputTokens     int `json:"output_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
 	}
 
 	if err := json.Unmarshal(body, &apiResponse); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
 
-	if len(apiResponse.Choices) == 0 {
-		return &LLMResponse{
-			Content:      "",
-			FinishReason: "stop",
-		}, nil
-	}
+	var contentBuilder strings.Builder
+	var reasoningBuilder strings.Builder
+	toolCalls := make([]ToolCall, 0)
 
-	choice := apiResponse.Choices[0]
-	toolCalls := make([]ToolCall, 0, len(choice.Message.ToolCalls))
-	for _, tc := range choice.Message.ToolCalls {
-		arguments := make(map[string]any)
-		name := ""
-
-		// Extract thought_signature from Gemini/Google-specific extra content
-		thoughtSignature := ""
-		if tc.ExtraContent != nil && tc.ExtraContent.Google != nil {
-			thoughtSignature = tc.ExtraContent.Google.ThoughtSignature
-		}
-
-		if tc.Function != nil {
-			name = tc.Function.Name
-			if tc.Function.Arguments != "" {
-				if err := json.Unmarshal([]byte(tc.Function.Arguments), &arguments); err != nil {
-					log.Printf("openai_compat: failed to decode tool call arguments for %q: %v", name, err)
-					arguments["raw"] = tc.Function.Arguments
+	for _, item := range apiResponse.Output {
+		switch item.Type {
+		case "message":
+			for _, content := range item.Content {
+				switch content.Type {
+				case "output_text", "text":
+					contentBuilder.WriteString(content.Text)
+				case "reasoning":
+					reasoningBuilder.WriteString(content.Text)
 				}
 			}
-		}
-
-		// Build ToolCall with ExtraContent for Gemini 3 thought_signature persistence
-		toolCall := ToolCall{
-			ID:               tc.ID,
-			Name:             name,
-			Arguments:        arguments,
-			ThoughtSignature: thoughtSignature,
-		}
-
-		if thoughtSignature != "" {
-			toolCall.ExtraContent = &ExtraContent{
-				Google: &GoogleExtra{
-					ThoughtSignature: thoughtSignature,
-				},
+		case "reasoning":
+			for _, summary := range item.Summary {
+				if summary.Type == "summary_text" || summary.Type == "text" {
+					reasoningBuilder.WriteString(summary.Text)
+				}
 			}
-		}
+		case "function_call":
+			arguments := make(map[string]any)
+			if item.Arguments != "" {
+				if err := json.Unmarshal([]byte(item.Arguments), &arguments); err != nil {
+					log.Printf("openai_compat: failed to decode tool call arguments for %q: %v", item.Name, err)
+					arguments["raw"] = item.Arguments
+				}
+			}
 
-		toolCalls = append(toolCalls, toolCall)
+			toolCalls = append(toolCalls, ToolCall{
+				ID:        item.CallID,
+				Name:      item.Name,
+				Arguments: arguments,
+			})
+		}
+	}
+
+	finishReason := "stop"
+	if len(toolCalls) > 0 {
+		finishReason = "tool_calls"
+	} else if apiResponse.Status == "incomplete" {
+		finishReason = "length"
+	}
+
+	var usage *UsageInfo
+	totalTokens := apiResponse.Usage.TotalTokens
+	if totalTokens == 0 {
+		totalTokens = apiResponse.Usage.InputTokens + apiResponse.Usage.OutputTokens
+	}
+	if totalTokens > 0 {
+		promptTokens := apiResponse.Usage.PromptTokens
+		if promptTokens == 0 {
+			promptTokens = apiResponse.Usage.InputTokens
+		}
+		completionTokens := apiResponse.Usage.CompletionTokens
+		if completionTokens == 0 {
+			completionTokens = apiResponse.Usage.OutputTokens
+		}
+		usage = &UsageInfo{
+			PromptTokens:     promptTokens,
+			CompletionTokens: completionTokens,
+			TotalTokens:      totalTokens,
+		}
 	}
 
 	return &LLMResponse{
-		Content:          choice.Message.Content,
-		ReasoningContent: choice.Message.ReasoningContent,
+		Content:          contentBuilder.String(),
+		ReasoningContent: reasoningBuilder.String(),
 		ToolCalls:        toolCalls,
-		FinishReason:     choice.FinishReason,
-		Usage:            apiResponse.Usage,
+		FinishReason:     finishReason,
+		Usage:            usage,
 	}, nil
 }
 
-// openaiMessage is the wire-format message for OpenAI-compatible APIs.
-// It mirrors protocoltypes.Message but omits SystemParts, which is an
-// internal field that would be unknown to third-party endpoints.
-type openaiMessage struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
+// buildResponseInput converts internal messages to Responses API input items.
+// It maps text turns to `message`, assistant tool invocations to `function_call`,
+// and tool outputs to `function_call_output`.
+func buildResponseInput(messages []Message) []map[string]any {
+	input := make([]map[string]any, 0, len(messages))
+	for _, msg := range messages {
+		if isToolOutputMessage(msg) {
+			input = append(input, map[string]any{
+				"type":    "function_call_output",
+				"call_id": msg.ToolCallID,
+				"output":  msg.Content,
+			})
+			continue
+		}
+
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			if msg.Content != "" {
+				input = append(input, responseMessageItem(msg.Role, msg.Content))
+			}
+			for _, toolCall := range msg.ToolCalls {
+				name, arguments, ok := resolveToolCallForResponseInput(toolCall)
+				if !ok {
+					continue
+				}
+				input = append(input, map[string]any{
+					"type":      "function_call",
+					"call_id":   toolCall.ID,
+					"name":      name,
+					"arguments": arguments,
+				})
+			}
+			continue
+		}
+
+		if msg.Content == "" {
+			continue
+		}
+		input = append(input, responseMessageItem(msg.Role, msg.Content))
+	}
+	return input
 }
 
-// stripSystemParts converts []Message to []openaiMessage, dropping the
-// SystemParts field so it doesn't leak into the JSON payload sent to
-// OpenAI-compatible APIs (some strict endpoints reject unknown fields).
-func stripSystemParts(messages []Message) []openaiMessage {
-	out := make([]openaiMessage, len(messages))
-	for i, m := range messages {
-		out[i] = openaiMessage{
-			Role:       m.Role,
-			Content:    m.Content,
-			ToolCalls:  m.ToolCalls,
-			ToolCallID: m.ToolCallID,
+// toResponseTools converts internal tool definitions to Responses API tools.
+func toResponseTools(tools []ToolDefinition) []map[string]any {
+	result := make([]map[string]any, 0, len(tools))
+	for _, tool := range tools {
+		if tool.Type != "function" {
+			continue
 		}
+		entry := map[string]any{
+			"type":       "function",
+			"name":       tool.Function.Name,
+			"parameters": tool.Function.Parameters,
+		}
+		if tool.Function.Description != "" {
+			entry["description"] = tool.Function.Description
+		}
+		result = append(result, entry)
 	}
-	return out
+	return result
+}
+
+// responseMessageItem builds a Responses API message input item.
+func responseMessageItem(role, content string) map[string]any {
+	if role == "system" {
+		role = "developer"
+	}
+	return map[string]any{
+		"type": "message",
+		"role": role,
+		"content": []map[string]any{
+			{
+				"type": "input_text",
+				"text": content,
+			},
+		},
+	}
+}
+
+// isToolOutputMessage reports whether a message is a tool result.
+func isToolOutputMessage(msg Message) bool {
+	return msg.ToolCallID != "" && (msg.Role == "tool" || msg.Role == "user")
+}
+
+// resolveToolCallForResponseInput extracts name and arguments for a function call item.
+func resolveToolCallForResponseInput(toolCall ToolCall) (string, string, bool) {
+	name := toolCall.Name
+	if name == "" && toolCall.Function != nil {
+		name = toolCall.Function.Name
+	}
+	if name == "" {
+		return "", "", false
+	}
+
+	if len(toolCall.Arguments) > 0 {
+		encoded, err := json.Marshal(toolCall.Arguments)
+		if err != nil {
+			return "", "", false
+		}
+		return name, string(encoded), true
+	}
+
+	if toolCall.Function != nil && toolCall.Function.Arguments != "" {
+		return name, toolCall.Function.Arguments, true
+	}
+
+	return name, "{}", true
 }
 
 func normalizeModel(model, apiBase string) string {
