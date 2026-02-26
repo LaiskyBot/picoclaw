@@ -298,7 +298,7 @@ func TestTaskPipeline_BuildStatusReplyIncludesTiming(t *testing.T) {
 	require.Contains(t, completed, "duration=")
 }
 
-// TestBuildPlannerDelegationPrompt_IncludesDelegationContext verifies planner prompt includes memory/history reference text.
+// TestBuildPlannerDelegationPrompt_IncludesDelegationContext verifies delegated prompt includes memory/history reference text.
 // It builds a pipeline task with delegation context and checks prompt sections.
 // It returns no value and fails test on missing expected content.
 func TestBuildPlannerDelegationPrompt_IncludesDelegationContext(t *testing.T) {
@@ -310,6 +310,7 @@ func TestBuildPlannerDelegationPrompt_IncludesDelegationContext(t *testing.T) {
 	}
 
 	prompt := buildPlannerDelegationPrompt(task)
+	require.Contains(t, prompt, "You are picoclaw, handling a background task for the user.")
 	require.Contains(t, prompt, "Task tracking id: task-2026-02-25-0001")
 	require.Contains(t, prompt, "Delegation reference (memory and interaction history):")
 	require.Contains(t, prompt, "root cause first")

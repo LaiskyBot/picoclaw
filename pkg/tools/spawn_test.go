@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestSpawnTool_Execute_EmptyTask(t *testing.T) {
@@ -76,4 +78,20 @@ func TestSpawnTool_Execute_NilManager(t *testing.T) {
 	if !strings.Contains(result.ForLLM, "Subagent manager not configured") {
 		t.Errorf("Error message should mention manager not configured, got: %s", result.ForLLM)
 	}
+}
+
+func TestBuildDelegatedTaskPayload(t *testing.T) {
+	t.Parallel()
+
+	task := buildDelegatedTaskPayload(
+		"Investigate service restart loop",
+		"Systemd logs show intermittent network failures",
+		"Find root cause and apply minimal fix",
+		"Service remains healthy for 5 minutes and logs show no restart loop",
+	)
+
+	require.Contains(t, task, "Task:\nInvestigate service restart loop")
+	require.Contains(t, task, "Objective:\nFind root cause and apply minimal fix")
+	require.Contains(t, task, "Context:\nSystemd logs show intermittent network failures")
+	require.Contains(t, task, "Acceptance Criteria:\nService remains healthy for 5 minutes and logs show no restart loop")
 }

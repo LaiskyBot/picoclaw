@@ -70,6 +70,7 @@ func NewAgentInstance(
 		agentName = agentCfg.Name
 		subagents = agentCfg.Subagents
 		skillsFilter = agentCfg.Skills
+		contextBuilder.SetSkillsFilter(skillsFilter)
 	}
 
 	maxIter := defaults.MaxToolIterations

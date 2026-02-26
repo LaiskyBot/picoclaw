@@ -3,9 +3,12 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -109,6 +112,24 @@ func (t *InstallSkillTool) Execute(ctx context.Context, args map[string]any) *To
 		return ErrorResult(fmt.Sprintf("registry %q not found", registryName))
 	}
 
+	if !force {
+		if existingPath, existingName, found := t.findEquivalentInstalledSkill(ctx, registry, skillsDir, slug); found {
+			logger.DebugCF("tool", "Equivalent skill already installed",
+				map[string]any{
+					"tool":            "install_skill",
+					"requested_slug":  slug,
+					"registry":        registry.Name(),
+					"existing_name":   existingName,
+					"existing_path":   existingPath,
+					"requested_target": targetDir,
+				})
+			return ErrorResult(
+				fmt.Sprintf("skill %q is already available as %q at %s. Reuse the installed skill or set force=true to install anyway.",
+					slug, existingName, existingPath),
+			)
+		}
+	}
+
 	// Ensure skills directory exists.
 	if err := os.MkdirAll(skillsDir, 0o755); err != nil {
 		return ErrorResult(fmt.Sprintf("failed to create skills directory: %v", err))
@@ -172,6 +193,117 @@ func (t *InstallSkillTool) Execute(ctx context.Context, args map[string]any) *To
 	output += "\nThe skill is now available and can be loaded in the current session."
 
 	return SilentResult(output)
+}
+
+// findEquivalentInstalledSkill checks whether a semantically equivalent skill is already installed.
+// It returns the existing SKILL.md path and canonical name when a match is found.
+func (t *InstallSkillTool) findEquivalentInstalledSkill(
+	ctx context.Context,
+	registry skills.SkillRegistry,
+	skillsDir, requestedSlug string,
+) (string, string, bool) {
+	if skillsDir == "" {
+		return "", "", false
+	}
+
+	if path, name, found := findInstalledByOriginMeta(skillsDir, registry.Name(), requestedSlug); found {
+		return path, name, true
+	}
+
+	matchNames := map[string]struct{}{
+		normalizeSkillMatchName(requestedSlug): {},
+	}
+
+	meta, err := registry.GetSkillMeta(ctx, requestedSlug)
+	if err != nil {
+		logger.DebugCF("tool", "Failed to resolve skill metadata for dedupe",
+			map[string]any{
+				"tool":     "install_skill",
+				"slug":     requestedSlug,
+				"registry": registry.Name(),
+				"error":    err.Error(),
+			})
+	} else {
+		if n := normalizeSkillMatchName(meta.Slug); n != "" {
+			matchNames[n] = struct{}{}
+		}
+		if n := normalizeSkillMatchName(meta.DisplayName); n != "" {
+			matchNames[n] = struct{}{}
+		}
+	}
+
+	loader := skills.NewSkillsLoader(t.workspace, "", "")
+	for _, installed := range loader.ListSkills() {
+		installedDir := filepath.Base(filepath.Dir(installed.Path))
+		if strings.EqualFold(installedDir, requestedSlug) {
+			continue
+		}
+
+		if _, ok := matchNames[normalizeSkillMatchName(installed.Name)]; ok {
+			return installed.Path, installed.Name, true
+		}
+		if installed.DisplayName != "" {
+			if _, ok := matchNames[normalizeSkillMatchName(installed.DisplayName)]; ok {
+				return installed.Path, installed.Name, true
+			}
+		}
+	}
+
+	return "", "", false
+}
+
+// findInstalledByOriginMeta finds an installed skill by origin metadata.
+// It returns the SKILL.md path and canonical name when registry+slug match.
+func findInstalledByOriginMeta(skillsDir, registryName, slug string) (string, string, bool) {
+	entries, err := os.ReadDir(skillsDir)
+	if err != nil {
+		if !errorsIsNotExist(err) {
+			logger.DebugCF("tool", "Failed reading skills directory for dedupe",
+				map[string]any{"tool": "install_skill", "skills_dir": skillsDir, "error": err.Error()})
+		}
+		return "", "", false
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dirName := entry.Name()
+		metaPath := filepath.Join(skillsDir, dirName, ".skill-origin.json")
+		data, err := os.ReadFile(metaPath)
+		if err != nil {
+			continue
+		}
+		var meta originMeta
+		if err := json.Unmarshal(data, &meta); err != nil {
+			continue
+		}
+		if strings.EqualFold(meta.Registry, registryName) && strings.EqualFold(meta.Slug, slug) {
+			skillPath := filepath.Join(skillsDir, dirName, "SKILL.md")
+			if _, statErr := os.Stat(skillPath); statErr == nil {
+				return skillPath, dirName, true
+			}
+		}
+	}
+
+	return "", "", false
+}
+
+// normalizeSkillMatchName normalizes names for fuzzy duplicate matching.
+func normalizeSkillMatchName(name string) string {
+	name = strings.TrimSpace(strings.ToLower(name))
+	name = strings.ReplaceAll(name, "_", "-")
+	name = strings.ReplaceAll(name, " ", "-")
+	for strings.Contains(name, "--") {
+		name = strings.ReplaceAll(name, "--", "-")
+	}
+	name = strings.Trim(name, "-")
+	return name
+}
+
+// errorsIsNotExist returns true if err is fs.ErrNotExist-compatible.
+func errorsIsNotExist(err error) bool {
+	return err != nil && (os.IsNotExist(err) || errors.Is(err, fs.ErrNotExist))
 }
 
 // originMeta tracks which registry a skill was installed from.

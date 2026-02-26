@@ -197,6 +197,73 @@ func TestListSkillsMetadataNameDedup(t *testing.T) {
 	assert.Equal(t, "workspace", skills[0].Source)
 }
 
+func TestListSkillsInvalidMetadataNameFallsBackToDirectoryName(t *testing.T) {
+	tmp := t.TempDir()
+	ws := filepath.Join(tmp, "workspace")
+
+	createSkillDir(t, filepath.Join(ws, "skills"), "agent-browser", "Agent Browser", "browser automation")
+
+	sl := NewSkillsLoader(ws, "", "")
+	skills := sl.ListSkills()
+
+	require.Len(t, skills, 1)
+	assert.Equal(t, "agent-browser", skills[0].Name)
+	assert.Equal(t, "Agent Browser", skills[0].DisplayName)
+	assert.Equal(t, "browser automation", skills[0].Description)
+}
+
+func TestListSkillsIncludesReadWhenAndScriptHints(t *testing.T) {
+	tmp := t.TempDir()
+	ws := filepath.Join(tmp, "workspace")
+	skillDir := filepath.Join(ws, "skills", "browser")
+	require.NoError(t, os.MkdirAll(filepath.Join(skillDir, "scripts"), 0o755))
+
+	content := `---
+name: browser
+description: browser automation
+read_when:
+  - Automating web interactions
+  - Filling forms
+---
+# Browser
+`
+	require.NoError(t, os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(content), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(skillDir, "scripts", "run.sh"), []byte("#!/bin/sh\necho ok\n"), 0o644))
+
+	sl := NewSkillsLoader(ws, "", "")
+	items := sl.ListSkills()
+
+	require.Len(t, items, 1)
+	assert.Equal(t, []string{"Automating web interactions", "Filling forms"}, items[0].ReadWhen)
+	assert.Equal(t, []string{"scripts/run.sh"}, items[0].ScriptHints)
+}
+
+func TestBuildSkillsSummaryIncludesReadWhenAndScripts(t *testing.T) {
+	tmp := t.TempDir()
+	ws := filepath.Join(tmp, "workspace")
+	skillDir := filepath.Join(ws, "skills", "browser")
+	require.NoError(t, os.MkdirAll(filepath.Join(skillDir, "scripts"), 0o755))
+
+	content := `---
+name: browser
+description: browser automation
+read_when:
+  - Automating web interactions
+---
+# Browser
+`
+	require.NoError(t, os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(content), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(skillDir, "scripts", "run.sh"), []byte("#!/bin/sh\necho ok\n"), 0o644))
+
+	sl := NewSkillsLoader(ws, "", "")
+	summary := sl.BuildSkillsSummary()
+
+	assert.Contains(t, summary, "<read_when>")
+	assert.Contains(t, summary, "<hint>Automating web interactions</hint>")
+	assert.Contains(t, summary, "<scripts>")
+	assert.Contains(t, summary, "<entry>scripts/run.sh</entry>")
+}
+
 func TestListSkillsMultipleDistinctSkills(t *testing.T) {
 	tmp := t.TempDir()
 	ws := filepath.Join(tmp, "workspace")

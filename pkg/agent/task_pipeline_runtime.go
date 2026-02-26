@@ -42,7 +42,7 @@ func (al *AgentLoop) startTaskPipelineRuntime(ctx context.Context) {
 			Channel: task.Channel,
 			ChatID:  task.ChatID,
 			Content: fmt.Sprintf(
-				"Task %s was recovered after restart and is queued to resume automatically.",
+				"Task %s resumed automatically after restart.",
 				taskLabel(task),
 			),
 		})
@@ -107,20 +107,15 @@ func (al *AgentLoop) runTaskTimeoutLoop(ctx context.Context) {
 func (al *AgentLoop) executePlannerTask(parentCtx context.Context, task *PipelineTask) {
 	defer al.maybePromoteQueuedTasks()
 
-	planner := al.getPlannerAgent()
-	if planner == nil {
-		al.taskPipeline.MarkFailed(task.ID, "Planner agent is not configured")
-		al.publishTaskFinalReport(task.ID, "", fmt.Errorf("planner agent is not configured"))
+	runner := al.getPlannerAgent()
+	if runner == nil {
+		al.taskPipeline.MarkFailed(task.ID, "assistant agent is not configured")
+		al.publishTaskFinalReport(task.ID, "", fmt.Errorf("assistant agent is not configured"))
 		return
 	}
 
-	al.taskPipeline.MarkRunning(task.ID, planner.ID)
+	al.taskPipeline.MarkRunning(task.ID, runner.ID)
 	al.taskPipeline.CheckpointTask(task.ID, "planner run started")
-	al.bus.PublishOutbound(bus.OutboundMessage{
-		Channel: task.Channel,
-		ChatID:  task.ChatID,
-		Content: fmt.Sprintf("Task %s is now running with planner '%s'.", taskLabel(task), planner.ID),
-	})
 
 	runCtx, cancel := context.WithTimeout(parentCtx, 40*time.Minute)
 	defer cancel()
@@ -143,9 +138,9 @@ func (al *AgentLoop) executePlannerTask(parentCtx context.Context, task *Pipelin
 	defer close(heartbeatDone)
 
 	plannerPrompt := buildPlannerDelegationPrompt(task)
-	sessionKey := fmt.Sprintf("agent:%s:pipeline:%s", planner.ID, task.ID)
+	sessionKey := fmt.Sprintf("agent:%s:pipeline:%s", runner.ID, task.ID)
 
-	result, err := al.runAgentLoop(runCtx, planner, processOptions{
+	result, err := al.runAgentLoop(runCtx, runner, processOptions{
 		SessionKey:      sessionKey,
 		Channel:         plannerTaskChannel,
 		ChatID:          task.ID,
@@ -185,7 +180,7 @@ func (al *AgentLoop) publishTaskFinalReport(taskID, plannerSummary string, runEr
 		summary = strings.TrimSpace(task.PlannerResult)
 	}
 	if summary == "" || summary == plannerEmptySummaryText {
-		summary = "No textual planner summary was provided."
+		summary = "No textual summary was produced."
 	}
 
 	finalStatus := task.Status
@@ -214,8 +209,6 @@ func formatTaskFinalReport(task *PipelineTask, finalStatus, summary string) stri
 		return "Task finished, but details are unavailable."
 	}
 
-	started := formatUnixMilliUTC(task.StartedAtUTC)
-	finished := formatUnixMilliUTC(task.FinishedAtUTC)
 	duration := "unknown"
 	if task.StartedAtUTC > 0 && task.FinishedAtUTC > 0 && task.FinishedAtUTC >= task.StartedAtUTC {
 		duration = (time.Duration(task.FinishedAtUTC-task.StartedAtUTC) * time.Millisecond).String()
@@ -227,16 +220,11 @@ func formatTaskFinalReport(task *PipelineTask, finalStatus, summary string) stri
 	}
 
 	return fmt.Sprintf(
-		"Task %s finished.\n- status: %s\n- planner: %s\n- task_summary: %s\n- started_at_utc: %s\n- finished_at_utc: %s\n- duration: %s\n- worker_updates: %d\n- summary: %s",
+		"Task %s finished (%s).\nSummary: %s\nDuration: %s",
 		taskLabel(task),
 		finalStatus,
-		valueOrNA(task.PlannerAgent),
-		valueOrNA(task.Summary),
-		started,
-		finished,
-		duration,
-		len(task.WorkerEvents),
 		utils.Truncate(textSummary, 2800),
+		duration,
 	)
 }
 
@@ -569,13 +557,10 @@ func collectTaskIDs(tasks []*PipelineTask) []string {
 	return ids
 }
 
-// getPlannerAgent resolves the planner role from configured agents.
-// It returns agent with ID "planner" when available, otherwise default agent.
+// getPlannerAgent resolves the runtime assistant for delegated tasks.
+// It returns the default user-facing agent and intentionally ignores dedicated planner roles.
 // It returns nil when registry has no agents.
 func (al *AgentLoop) getPlannerAgent() *AgentInstance {
-	if planner, ok := al.registry.GetAgent("planner"); ok {
-		return planner
-	}
 	return al.registry.GetDefaultAgent()
 }
 
@@ -588,7 +573,7 @@ func buildPlannerDelegationPrompt(task *PipelineTask) string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("You are the planner agent in a plan-worker pipeline.\n")
+	sb.WriteString("You are picoclaw, handling a background task for the user.\n")
 	sb.WriteString("Task tracking id: ")
 	sb.WriteString(task.ID)
 	sb.WriteString("\n")
@@ -602,11 +587,11 @@ func buildPlannerDelegationPrompt(task *PipelineTask) string {
 		sb.WriteString(task.DelegationContext)
 		sb.WriteString("\n")
 	}
-	sb.WriteString("Use tools to classify work, break it down, and delegate worker steps when needed.\n")
+	sb.WriteString("Use tools to complete the task end-to-end. Delegate worker subagents only when the task is long-running or parallelizable.\n")
 	sb.WriteString("For Skills workflows, prefer find_skills then install_skill, then read the installed SKILL.md and execute steps.\n")
 	sb.WriteString("For MCP workflows, distinguish local vs remote MCP. Local MCP is configured under tools.mcp.local, and remote MCP is configured/managed under tools.mcp.remote and via remote_mcp operations.\n")
-	sb.WriteString("When spawning workers, include explicit labels so progress is traceable.\n")
-	sb.WriteString("Always produce a final status summary with success/failure and next actions.\n\n")
+	sb.WriteString("When spawning workers, include enough context, explicit objective, acceptance criteria, and a concise label.\n")
+	sb.WriteString("Always produce a concise final summary with outcome and any next action.\n\n")
 	sb.WriteString("User request:\n")
 	sb.WriteString(task.Request)
 

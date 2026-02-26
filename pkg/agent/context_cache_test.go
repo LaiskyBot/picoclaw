@@ -511,3 +511,24 @@ func BenchmarkBuildMessagesWithCache(b *testing.B) {
 		_ = cb.BuildMessages(history, "summary", "new message", nil, "cli", "test")
 	}
 }
+
+// TestBuildSystemPromptWithSkillsFilter verifies configured skills filter is applied
+// when rendering the skills summary section.
+func TestBuildSystemPromptWithSkillsFilter(t *testing.T) {
+	tmpDir := setupWorkspace(t, map[string]string{
+		"skills/agent-browser/SKILL.md": "---\nname: Agent Browser\ndescription: Browser automation\n---\n# Browser",
+		"skills/github/SKILL.md":        "---\nname: github\ndescription: GitHub ops\n---\n# GitHub",
+	})
+	defer os.RemoveAll(tmpDir)
+
+	cb := NewContextBuilder(tmpDir)
+	cb.SetSkillsFilter([]string{"github"})
+
+	prompt := cb.BuildSystemPromptWithCache()
+	if !strings.Contains(prompt, "<name>github</name>") {
+		t.Fatalf("prompt should contain filtered skill github")
+	}
+	if strings.Contains(prompt, "agent-browser") {
+		t.Fatalf("prompt should not contain filtered-out skill agent-browser")
+	}
+}

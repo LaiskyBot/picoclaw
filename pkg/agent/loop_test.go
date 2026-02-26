@@ -807,7 +807,7 @@ func TestProcessMessage_ExternalChannelsDelegateWithoutForegroundLLM(t *testing.
 				Content:  "Please investigate this issue thoroughly and execute a full solution plan.",
 			})
 			require.NoError(t, runErr)
-			require.Contains(t, response, "accepted. I have delegated it to the planner")
+			require.Contains(t, response, "accepted. I started it in the background")
 			require.EqualValues(t, 1, provider.Calls(), "task creation should call provider once for task brief generation")
 			require.True(t, strings.Contains(strings.ToLower(response), "task "))
 			require.Regexp(t, regexp.MustCompile(`task-\d{4}-\d{2}-\d{2}-\d{4}\([^)]+\)`), response)

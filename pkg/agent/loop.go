@@ -430,7 +430,7 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 		}
 
 		return fmt.Sprintf(
-			"Task %s accepted. I have delegated it to the planner and will keep you updated. Send /status anytime for progress.",
+			"Task %s accepted. I started it in the background and will report back.",
 			taskLabel(task),
 		), nil
 	}
@@ -503,26 +503,6 @@ func (al *AgentLoop) processSystemMessage(ctx context.Context, msg bus.InboundMe
 				"sender_id":        msg.SenderID,
 			})
 			return "", nil
-		}
-
-		task, ok := al.taskPipeline.GetTaskByID(originChatID)
-		if ok {
-			elapsed := "unknown"
-			if task.StartedAtUTC > 0 {
-				elapsed = (time.Since(time.UnixMilli(task.StartedAtUTC).UTC())).Round(time.Second).String()
-			}
-			al.bus.PublishOutbound(bus.OutboundMessage{
-				Channel: task.Channel,
-				ChatID:  task.ChatID,
-				Content: fmt.Sprintf(
-					"Worker update for %s.\n- status: %s\n- started_at_utc: %s\n- elapsed: %s\n- update: %s",
-					task.ID,
-					task.Status,
-					formatUnixMilliUTC(task.StartedAtUTC),
-					elapsed,
-					msg.Content,
-				),
-			})
 		}
 		return "", nil
 	}

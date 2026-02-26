@@ -19,6 +19,7 @@ import (
 type ContextBuilder struct {
 	workspace    string
 	skillsLoader *skills.SkillsLoader
+	skillsFilter []string
 	memory       *MemoryStore
 
 	// Cache for system prompt to avoid rebuilding on every call.
@@ -57,6 +58,23 @@ func NewContextBuilder(workspace string) *ContextBuilder {
 	}
 }
 
+// SetSkillsFilter sets optional skill names to include in system prompt summary.
+// Empty filter means include all discovered skills.
+func (cb *ContextBuilder) SetSkillsFilter(skillNames []string) {
+	cb.systemPromptMutex.Lock()
+	defer cb.systemPromptMutex.Unlock()
+
+	if len(skillNames) == 0 {
+		cb.skillsFilter = nil
+	} else {
+		cb.skillsFilter = append([]string(nil), skillNames...)
+	}
+
+	cb.cachedSystemPrompt = ""
+	cb.cachedAt = time.Time{}
+	cb.existedAtCache = nil
+}
+
 func (cb *ContextBuilder) getIdentity() string {
 	workspacePath, _ := filepath.Abs(filepath.Join(cb.workspace))
 
@@ -80,9 +98,15 @@ Your workspace is at: %s
 
 4. **Be helpful and accurate** - When using tools, briefly explain what you're doing.
 
-5. **Memory** - When interacting with me if something seems memorable, update %s/memory/MEMORY.md
+5. **Communication style** - Communicate like a human assistant: short, friendly, and direct. Avoid repetitive process narration or long mechanical status dumps unless the user explicitly asks for detailed progress logs.
 
-6. **Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.`,
+6. **Long tasks must be delegated** - For long-running or blocking work, quickly dispatch it through spawn/subagent style tooling instead of blocking foreground conversation. Keep the chat responsive.
+
+7. **Delegation quality** - When dispatching a sub-task, include enough context, clear objective, constraints, and explicit acceptance criteria so workers can execute independently and verifiably.
+
+8. **Memory** - When interacting with me if something seems memorable, update %s/memory/MEMORY.md
+
+9. **Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.`,
 		workspacePath, workspacePath, workspacePath, workspacePath, workspacePath)
 }
 
@@ -99,11 +123,16 @@ func (cb *ContextBuilder) BuildSystemPrompt() string {
 	}
 
 	// Skills - show summary, AI can read full content with read_file tool
-	skillsSummary := cb.skillsLoader.BuildSkillsSummary()
+	skillsSummary := cb.skillsLoader.BuildSkillsSummaryWithFilter(cb.skillsFilter)
 	if skillsSummary != "" {
 		parts = append(parts, fmt.Sprintf(`# Skills
 
-The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
+Skills follow a 3-layer lazy-loading workflow:
+1) Metadata is preloaded below at startup (name/description/read_when/scripts hints).
+2) Instructions are loaded on demand by reading a matching skill's SKILL.md via read_file.
+3) Scripts are executed as commands when instructed by SKILL.md; load script output into context, not script source by default.
+
+Reuse installed skills first. Only use find_skills + install_skill if no installed skill matches the requested capability.
 
 %s`, skillsSummary))
 	}
@@ -574,13 +603,27 @@ func (cb *ContextBuilder) AddAssistantMessage(
 // GetSkillsInfo returns information about loaded skills.
 func (cb *ContextBuilder) GetSkillsInfo() map[string]any {
 	allSkills := cb.skillsLoader.ListSkills()
+	filteredSkills := allSkills
+	if len(cb.skillsFilter) > 0 {
+		filteredSkills = make([]skills.SkillInfo, 0, len(allSkills))
+		allowed := make(map[string]bool, len(cb.skillsFilter))
+		for _, name := range cb.skillsFilter {
+			allowed[strings.ToLower(strings.TrimSpace(name))] = true
+		}
+		for _, s := range allSkills {
+			if allowed[strings.ToLower(strings.TrimSpace(s.Name))] {
+				filteredSkills = append(filteredSkills, s)
+			}
+		}
+	}
+
 	skillNames := make([]string, 0, len(allSkills))
-	for _, s := range allSkills {
+	for _, s := range filteredSkills {
 		skillNames = append(skillNames, s.Name)
 	}
 	return map[string]any{
 		"total":     len(allSkills),
-		"available": len(allSkills),
+		"available": len(filteredSkills),
 		"names":     skillNames,
 	}
 }
