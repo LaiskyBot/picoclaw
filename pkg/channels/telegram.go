@@ -226,6 +226,12 @@ func (c *TelegramChannel) sendTextResponse(
 				"reply_markup_present": replyMarkup != nil,
 				"error":                err.Error(),
 			})
+			logger.DebugCF("telegram", "Telegram edit HTML payload preview", map[string]any{
+				"chat_id":       chatIDStr,
+				"message_id":    pID.(int),
+				"content_chars": len(content),
+				"html_preview":  utils.Truncate(htmlContent, 512),
+			})
 
 			editMsg.ParseMode = ""
 			if _, plainErr := c.bot.EditMessageText(ctx, editMsg); plainErr == nil {
@@ -248,6 +254,11 @@ func (c *TelegramChannel) sendTextResponse(
 			"chat_id":              chatIDStr,
 			"reply_markup_present": replyMarkup != nil,
 			"error":                err.Error(),
+		})
+		logger.DebugCF("telegram", "Telegram HTML payload preview", map[string]any{
+			"chat_id":       chatIDStr,
+			"content_chars": len(content),
+			"html_preview":  utils.Truncate(htmlContent, 512),
 		})
 		tgMsg.ParseMode = ""
 		_, err = c.bot.SendMessage(ctx, tgMsg)
@@ -733,13 +744,14 @@ func markdownToTelegramHTML(text string) string {
 	inlineCodes := extractInlineCodes(text)
 	text = inlineCodes.text
 
+	markdownLinks := extractMarkdownLinks(text)
+	text = markdownLinks.text
+
 	text = regexp.MustCompile(`^#{1,6}\s+(.+)$`).ReplaceAllString(text, "$1")
 
 	text = regexp.MustCompile(`^>\s*(.*)$`).ReplaceAllString(text, "$1")
 
 	text = escapeHTML(text)
-
-	text = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`).ReplaceAllString(text, `<a href="$2">$1</a>`)
 
 	text = regexp.MustCompile(`\*\*(.+?)\*\*`).ReplaceAllString(text, "<b>$1</b>")
 
@@ -769,6 +781,14 @@ func markdownToTelegramHTML(text string) string {
 			text,
 			fmt.Sprintf("\x00CB%d\x00", i),
 			fmt.Sprintf("<pre><code>%s</code></pre>", escaped),
+		)
+	}
+
+	for i, link := range markdownLinks.links {
+		text = strings.ReplaceAll(
+			text,
+			fmt.Sprintf("\x00LK%d\x00", i),
+			fmt.Sprintf("<a href=\"%s\">%s</a>", escapeHTMLAttr(link.url), escapeHTML(link.label)),
 		)
 	}
 
@@ -804,6 +824,16 @@ type inlineCodeMatch struct {
 	codes []string
 }
 
+type markdownLink struct {
+	label string
+	url   string
+}
+
+type markdownLinkMatch struct {
+	text  string
+	links []markdownLink
+}
+
 func extractInlineCodes(text string) inlineCodeMatch {
 	re := regexp.MustCompile("`([^`]+)`")
 	matches := re.FindAllStringSubmatch(text, -1)
@@ -823,9 +853,42 @@ func extractInlineCodes(text string) inlineCodeMatch {
 	return inlineCodeMatch{text: text, codes: codes}
 }
 
+// extractMarkdownLinks extracts markdown links from text and replaces them with placeholders.
+// It accepts the source text and returns text with placeholders plus the original links.
+func extractMarkdownLinks(text string) markdownLinkMatch {
+	re := regexp.MustCompile(`!?\[([^\]]+)\]\(([^)\s]+)\)`)
+	matches := re.FindAllStringSubmatch(text, -1)
+
+	links := make([]markdownLink, 0, len(matches))
+	for _, match := range matches {
+		if len(match) < 3 {
+			continue
+		}
+		links = append(links, markdownLink{label: match[1], url: match[2]})
+	}
+
+	i := 0
+	text = re.ReplaceAllStringFunc(text, func(_ string) string {
+		placeholder := fmt.Sprintf("\x00LK%d\x00", i)
+		i++
+		return placeholder
+	})
+
+	return markdownLinkMatch{text: text, links: links}
+}
+
 func escapeHTML(text string) string {
 	text = strings.ReplaceAll(text, "&", "&amp;")
 	text = strings.ReplaceAll(text, "<", "&lt;")
 	text = strings.ReplaceAll(text, ">", "&gt;")
+	return text
+}
+
+// escapeHTMLAttr escapes text for safe placement inside an HTML attribute value.
+// It accepts raw attribute text and returns escaped content suitable for quoted attributes.
+func escapeHTMLAttr(text string) string {
+	text = escapeHTML(text)
+	text = strings.ReplaceAll(text, `"`, "&quot;")
+	text = strings.ReplaceAll(text, "'", "&#39;")
 	return text
 }

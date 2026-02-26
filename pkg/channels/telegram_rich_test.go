@@ -3,6 +3,7 @@ package channels
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mymmrac/telego"
@@ -90,4 +91,30 @@ func TestApplyTelegramReplyMarkupToEditMessage(t *testing.T) {
 		require.NotNil(t, params.ReplyMarkup)
 		require.Equal(t, replyMarkup, params.ReplyMarkup)
 	})
+}
+
+func TestMarkdownToTelegramHTML_LinkWithUnderscoresPreserved(t *testing.T) {
+	input := "See [blog_laisky](https://blog.laisky.com/pages/0/?a=b_c&d=e_f) for details."
+	got := markdownToTelegramHTML(input)
+
+	require.Contains(t, got, `<a href="https://blog.laisky.com/pages/0/?a=b_c&amp;d=e_f">blog_laisky</a>`)
+	require.NotContains(t, got, "<i>")
+	require.NotContains(t, got, "</i>")
+}
+
+func TestMarkdownToTelegramHTML_ImageMarkdownWithUnderscores(t *testing.T) {
+	input := "![blog_laisky](https://example.com/blog_laisky.png)"
+	got := markdownToTelegramHTML(input)
+
+	require.Equal(t, `<a href="https://example.com/blog_laisky.png">blog_laisky</a>`, got)
+}
+
+func TestMarkdownToTelegramHTML_ItalicStillWorksOutsideLinks(t *testing.T) {
+	input := "hello _world_ [link_text](https://example.com/a_b)"
+	got := markdownToTelegramHTML(input)
+
+	require.Contains(t, got, "hello <i>world</i>")
+	require.Contains(t, got, `<a href="https://example.com/a_b">link_text</a>`)
+	require.Equal(t, 1, strings.Count(got, "<i>"))
+	require.Equal(t, 1, strings.Count(got, "</i>"))
 }
