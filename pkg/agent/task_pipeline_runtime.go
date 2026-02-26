@@ -193,16 +193,90 @@ func (al *AgentLoop) publishTaskFinalReport(taskID, plannerSummary string, runEr
 		if errText == "" {
 			errText = strings.TrimSpace(runErr.Error())
 		}
-		summary = fmt.Sprintf("Task failed: %s", errText)
+		summary = errText
 	}
 
-	report := formatTaskFinalReport(task, finalStatus, summary)
+	report := al.buildUserTaskFinalReport(task, finalStatus, summary)
+	logReport := formatTaskFinalLogReport(task, finalStatus, summary)
 	al.bus.PublishOutbound(bus.OutboundMessage{
 		Channel: task.Channel,
 		ChatID:  task.ChatID,
 		Content: report,
 	})
+
+	logger.InfoCF("agent", "Delegated task finished", map[string]any{
+		"task_id":      task.ID,
+		"status":       finalStatus,
+		"duration":     taskDuration(task),
+		"user_report":  report,
+		"detail_report": logReport,
+	})
 	al.recordDelegatedTaskResult(task, report)
+}
+
+// buildUserTaskFinalReport renders delegated task completion text for end users.
+// The task parameter provides request context, finalStatus is terminal lifecycle state, and summary is raw runtime output.
+// It returns an LLM-refined user reply when possible, or deterministic fallback text when rewrite fails.
+func (al *AgentLoop) buildUserTaskFinalReport(task *PipelineTask, finalStatus, summary string) string {
+	fallback := formatTaskFinalReport(task, finalStatus, summary)
+	if !shouldRewriteTaskSummary(summary) {
+		return fallback
+	}
+
+	planner := al.getPlannerAgent()
+	if planner == nil || planner.Provider == nil {
+		return fallback
+	}
+
+	rewriteCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	requestText := ""
+	if task != nil {
+		requestText = strings.TrimSpace(task.Request)
+	}
+
+	resp, err := planner.Provider.Chat(rewriteCtx, []providers.Message{
+		{Role: "system", Content: "Rewrite delegated task completion output for end users. Keep the same language as user request and summary. Output plain text only. Keep only user-relevant outcome and next action. Never include internal task IDs, status templates, execution durations, debug traces, or log metadata unless explicitly requested by the user. " + promptLengthControlHint},
+		{Role: "user", Content: fmt.Sprintf("Task status: %s\nOriginal user request:\n%s\n\nRaw task result:\n%s\n\nRewrite this into a concise user-facing reply.", finalStatus, requestText, summary)},
+	}, nil, planner.Model, map[string]any{
+		"max_tokens":  320,
+		"temperature": 0.1,
+	})
+	if err != nil || resp == nil {
+		return fallback
+	}
+
+	rewritten := normalizeTaskUserSummary(resp.Content)
+	if rewritten == "" {
+		return fallback
+	}
+
+	return utils.Truncate(rewritten, 2800)
+}
+
+// shouldRewriteTaskSummary reports whether raw task output needs LLM rewrite before user delivery.
+// The summary parameter is raw planner/runtime output text.
+// It returns true when operational wrapper patterns are present.
+func shouldRewriteTaskSummary(summary string) bool {
+	text := strings.TrimSpace(summary)
+	if text == "" || text == plannerEmptySummaryText {
+		return false
+	}
+
+	if strings.Contains(text, "\nSummary:") || strings.HasPrefix(text, "Summary:") {
+		return true
+	}
+	if strings.Contains(text, "\nDuration:") || strings.HasPrefix(text, "Duration:") {
+		return true
+	}
+	firstLine, _, _ := strings.Cut(text, "\n")
+	firstLine = strings.TrimSpace(firstLine)
+	if strings.HasPrefix(firstLine, "Task ") && strings.Contains(firstLine, " finished (") {
+		return true
+	}
+
+	return false
 }
 
 // recordDelegatedTaskResult appends delegated task final report into the routed conversation session.
@@ -253,17 +327,70 @@ func (al *AgentLoop) recordDelegatedTaskResult(task *PipelineTask, report string
 	})
 }
 
-// formatTaskFinalReport renders a concise task lifecycle summary for users.
-// The task parameter must include status and lifecycle timestamps.
-// It returns a user-facing multi-line report.
+// formatTaskFinalReport renders a concise, user-facing completion message.
+// The task parameter carries optional status context and summary is planner output text.
+// It returns friendly chat text without operational metadata.
 func formatTaskFinalReport(task *PipelineTask, finalStatus, summary string) string {
 	if task == nil {
-		return "Task finished, but details are unavailable."
+		if finalStatus == TaskStatusFailed {
+			return "Task failed."
+		}
+		return "Task completed."
 	}
 
-	duration := "unknown"
-	if task.StartedAtUTC > 0 && task.FinishedAtUTC > 0 && task.FinishedAtUTC >= task.StartedAtUTC {
-		duration = (time.Duration(task.FinishedAtUTC-task.StartedAtUTC) * time.Millisecond).String()
+	textSummary := normalizeTaskUserSummary(summary)
+	if textSummary == "" {
+		if finalStatus == TaskStatusFailed {
+			return "Task failed."
+		}
+		return "Task completed."
+	}
+
+	return utils.Truncate(textSummary, 2800)
+}
+
+// normalizeTaskUserSummary strips operational wrapper lines and keeps user-relevant text.
+// The summary parameter is raw planner/runtime summary that may include template-like fields.
+// It returns concise text intended for direct user delivery.
+func normalizeTaskUserSummary(summary string) string {
+	text := strings.TrimSpace(summary)
+	if text == "" || text == plannerEmptySummaryText {
+		return ""
+	}
+
+	lines := strings.Split(text, "\n")
+	clean := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "Summary:") {
+			trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "Summary:"))
+			if trimmed == "" {
+				continue
+			}
+			clean = append(clean, trimmed)
+			continue
+		}
+		if strings.HasPrefix(trimmed, "Duration:") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "Task ") && strings.Contains(trimmed, " finished (") {
+			continue
+		}
+		clean = append(clean, trimmed)
+	}
+
+	return strings.TrimSpace(strings.Join(clean, "\n"))
+}
+
+// formatTaskFinalLogReport renders lifecycle-rich task completion details for logs.
+// The task parameter includes timestamps, finalStatus indicates terminal state, and summary is planner output.
+// It returns a stable operational report string for troubleshooting.
+func formatTaskFinalLogReport(task *PipelineTask, finalStatus, summary string) string {
+	if task == nil {
+		return "Task finished, but details are unavailable."
 	}
 
 	textSummary := strings.TrimSpace(summary)
@@ -276,8 +403,21 @@ func formatTaskFinalReport(task *PipelineTask, finalStatus, summary string) stri
 		taskLabel(task),
 		finalStatus,
 		utils.Truncate(textSummary, 2800),
-		duration,
+		taskDuration(task),
 	)
+}
+
+// taskDuration returns elapsed runtime text for a finished task.
+// The task parameter provides started and finished UTC unix milliseconds.
+// It returns a human-readable duration or "unknown" when timing is incomplete.
+func taskDuration(task *PipelineTask) string {
+	if task == nil {
+		return "unknown"
+	}
+	if task.StartedAtUTC > 0 && task.FinishedAtUTC > 0 && task.FinishedAtUTC >= task.StartedAtUTC {
+		return (time.Duration(task.FinishedAtUTC-task.StartedAtUTC) * time.Millisecond).String()
+	}
+	return "unknown"
 }
 
 // formatUnixMilliUTC formats unix milliseconds as RFC3339 in UTC.
@@ -648,6 +788,7 @@ func buildPlannerDelegationPrompt(task *PipelineTask) string {
 	sb.WriteString("When generating images/files, deliver them via the message tool using attachments (photo/document with path/url/file_id).\n")
 	sb.WriteString("Never claim media was sent unless the message tool call already succeeded in this run.\n")
 	sb.WriteString("Do not output placeholders such as [Sending image] without a successful attachment send.\n")
+	sb.WriteString("For user-facing text, sound like a real human assistant and keep only user-relevant content. Do not include internal task IDs, system status templates, debug notes, or execution-duration lines unless the user explicitly asks for them.\n")
 	sb.WriteString("When spawning workers, include enough context, explicit objective, acceptance criteria, and a concise label.\n")
 	sb.WriteString("Always produce a concise final summary with outcome and any next action.\n\n")
 	sb.WriteString(promptLengthControlHint)

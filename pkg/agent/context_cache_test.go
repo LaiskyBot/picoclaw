@@ -126,6 +126,26 @@ func TestSingleSystemMessage(t *testing.T) {
 	}
 }
 
+// TestSystemPrompt_CommunicationStyleGuards verifies core prompt enforces human-style user communication and metadata hygiene.
+// The t parameter controls prompt-content assertions against communication and privacy guardrails.
+// It returns no value and fails when expected guardrail instructions are missing.
+func TestSystemPrompt_CommunicationStyleGuards(t *testing.T) {
+	tmpDir := setupWorkspace(t, map[string]string{
+		"IDENTITY.md": "# Identity\nTest agent.",
+	})
+	defer os.RemoveAll(tmpDir)
+
+	cb := NewContextBuilder(tmpDir)
+	prompt := cb.BuildSystemPromptWithCache()
+
+	if !strings.Contains(prompt, "Communicate like a human assistant") {
+		t.Fatal("system prompt missing human assistant communication instruction")
+	}
+	if !strings.Contains(prompt, "Do not expose internal task IDs") {
+		t.Fatal("system prompt missing internal metadata hiding instruction")
+	}
+}
+
 // TestMtimeAutoInvalidation verifies that the cache detects source file changes
 // via mtime without requiring explicit InvalidateCache().
 // Fix: original implementation had no auto-invalidation — edits to bootstrap files,
