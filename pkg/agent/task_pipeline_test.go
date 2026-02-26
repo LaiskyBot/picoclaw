@@ -2,7 +2,10 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -237,6 +240,87 @@ func TestTaskPipeline_NextSequenceForDateLocked(t *testing.T) {
 	require.Equal(t, 2, tp.nextSequenceForDateLocked("2026-02-25"))
 	require.Equal(t, 1, tp.nextSequenceForDateLocked("2026-02-26"))
 	require.Equal(t, 2, tp.nextSequenceForDateLocked("2026-02-26"))
+}
+
+// TestTaskPipeline_LoadLegacySnapshotRecoversCurrentDateSequence verifies sequence recovery when legacy snapshot metadata is missing.
+// It writes a snapshot containing only tasks and expects the next generated ID to continue from max current-day sequence.
+// It returns no value and fails test on duplicate or reset ID allocation.
+func TestTaskPipeline_LoadLegacySnapshotRecoversCurrentDateSequence(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "task-pipeline-legacy-sequence-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	dateKey := time.Now().UTC().Format(time.DateOnly)
+	legacy := map[string]any{
+		"tasks": []map[string]any{
+			{
+				"id":             fmt.Sprintf("task-%s-0001", dateKey),
+				"channel":        "telegram",
+				"chat_id":        "chat-legacy",
+				"sender_id":      "user-legacy",
+				"request":        "legacy 1",
+				"status":         TaskStatusDone,
+				"created_at_utc": 1,
+				"updated_at_utc": 1,
+			},
+			{
+				"id":             fmt.Sprintf("task-%s-0003", dateKey),
+				"channel":        "telegram",
+				"chat_id":        "chat-legacy",
+				"sender_id":      "user-legacy",
+				"request":        "legacy 3",
+				"status":         TaskStatusDone,
+				"created_at_utc": 3,
+				"updated_at_utc": 3,
+			},
+		},
+	}
+
+	stateDir := filepath.Join(tmpDir, "state")
+	require.NoError(t, os.MkdirAll(stateDir, 0o755))
+	data, err := json.Marshal(legacy)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(stateDir, taskPipelineFileName), data, 0o644))
+
+	tp := NewTaskPipeline(tmpDir, 0)
+	task, err := tp.EnqueueTask("telegram", "chat-legacy", "user-legacy", "new request", "new request")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	require.Equal(t, fmt.Sprintf("task-%s-0004", dateKey), task.ID)
+}
+
+// TestTaskPipeline_EnqueueTaskAvoidsIDCollision verifies stale sequence state does not overwrite existing tasks.
+// It forces sequence to collide with an existing current-day ID and expects enqueue to advance to the next available ID.
+// It returns no value and fails test on duplicate ID generation.
+func TestTaskPipeline_EnqueueTaskAvoidsIDCollision(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "task-pipeline-collision-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	tp := NewTaskPipeline(tmpDir, 0)
+	dateKey := time.Now().UTC().Format(time.DateOnly)
+	existingID := fmt.Sprintf("task-%s-0001", dateKey)
+
+	tp.mu.Lock()
+	tp.tasks[existingID] = &PipelineTask{
+		ID:           existingID,
+		Channel:      "telegram",
+		ChatID:       "chat-collision",
+		SenderID:     "user-collision",
+		Request:      "existing",
+		Status:       TaskStatusDone,
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+		UpdatedAtUTC: time.Now().UTC().UnixMilli(),
+	}
+	tp.lastSeqDate = dateKey
+	tp.nextSequence = 1
+	require.NoError(t, tp.saveLocked())
+	tp.mu.Unlock()
+
+	task, err := tp.EnqueueTask("telegram", "chat-collision", "user-collision", "new", "new")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	require.Equal(t, fmt.Sprintf("task-%s-0002", dateKey), task.ID)
 }
 
 // TestSanitizeTaskSummary verifies model output is normalized for task label display.

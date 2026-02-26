@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sort"
 	"strings"
 	"sync"
@@ -143,6 +144,17 @@ func (tp *TaskPipeline) EnqueueTaskWithScheduling(
 	dateKey := time.UnixMilli(nowUTC).UTC().Format(time.DateOnly)
 	sequence := tp.nextSequenceForDateLocked(dateKey)
 	taskID := buildTaskID(time.UnixMilli(nowUTC).UTC(), sequence)
+	for {
+		if _, exists := tp.tasks[taskID]; !exists {
+			break
+		}
+		logger.WarnCF("agent", "Task ID collision detected; advancing sequence", map[string]any{
+			"task_id":  taskID,
+			"date_key": dateKey,
+		})
+		sequence = tp.nextSequenceForDateLocked(dateKey)
+		taskID = buildTaskID(time.UnixMilli(nowUTC).UTC(), sequence)
+	}
 	task := &PipelineTask{
 		ID:             taskID,
 		Summary:        normalizedSummary,
@@ -893,15 +905,65 @@ func (tp *TaskPipeline) load() {
 	} else if snapshot.NextID > 0 {
 		tp.nextSequence = snapshot.NextID
 	}
-	if tp.nextSequence <= 0 {
-		tp.nextSequence = 1
-	}
+
+	maxSeqByDate := map[string]int{}
 	for _, task := range snapshot.Tasks {
 		if task == nil || task.ID == "" {
 			continue
 		}
 		tp.tasks[task.ID] = task
+		dateKey, seq, ok := parseTaskIDDateAndSequence(task.ID)
+		if !ok {
+			continue
+		}
+		if seq > maxSeqByDate[dateKey] {
+			maxSeqByDate[dateKey] = seq
+		}
 	}
+
+	currentDateKey := time.Now().UTC().Format(time.DateOnly)
+	if maxCurrentDateSeq := maxSeqByDate[currentDateKey]; maxCurrentDateSeq > 0 {
+		if tp.lastSeqDate != currentDateKey {
+			tp.lastSeqDate = currentDateKey
+		}
+		if tp.nextSequence <= maxCurrentDateSeq {
+			tp.nextSequence = maxCurrentDateSeq + 1
+		}
+	}
+
+	if tp.nextSequence <= 0 {
+		tp.nextSequence = 1
+	}
+
+	logger.DebugCF("agent", "Loaded task pipeline state", map[string]any{
+		"tasks":             len(tp.tasks),
+		"next_sequence":     tp.nextSequence,
+		"last_sequence_date": tp.lastSeqDate,
+		"storage_path":      tp.storagePath,
+	})
+}
+
+// parseTaskIDDateAndSequence extracts date and sequence from task IDs in format task-YYYY-MM-DD-NNNN.
+// The taskID parameter is the persisted task identifier string.
+// It returns parsed date key, numeric sequence, and whether parsing succeeded.
+func parseTaskIDDateAndSequence(taskID string) (string, int, bool) {
+	parts := strings.Split(strings.TrimSpace(taskID), "-")
+	if len(parts) != 5 {
+		return "", 0, false
+	}
+	if parts[0] != "task" {
+		return "", 0, false
+	}
+	dateKey := fmt.Sprintf("%s-%s-%s", parts[1], parts[2], parts[3])
+	if _, err := time.Parse(time.DateOnly, dateKey); err != nil {
+		return "", 0, false
+	}
+	seq, err := strconv.Atoi(parts[4])
+	if err != nil || seq <= 0 {
+		return "", 0, false
+	}
+
+	return dateKey, seq, true
 }
 
 // saveLocked persists current pipeline state atomically.

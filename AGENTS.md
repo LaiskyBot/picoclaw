@@ -38,7 +38,7 @@ Keep this message-bus-driven flow consistent when adding features: avoid couplin
 
 ### Configuration Model
 
-Configuration is JSON-based (`config/config.example.json`) with env override support in `pkg/config`.
+Configuration is JSON-based with env override support in `pkg/config`.
 
 - Prefer `model_list` + `agents.defaults.model_name` for model/provider selection.
 - `providers` is still supported for compatibility but is gradually deprecated.
@@ -68,6 +68,8 @@ Local tools and debugging related sensitive information is saved in `.github/ins
 Users communicate with the agent through Telegram, Discord, Slack, Feishu, WeCom, OneBot, and other channels. The agent has sudo privileges on the host machine and should follow user instructions, exercising full control over the host to accomplish user commands.
 
 Configuration file location: `~/.picoclaw/config.json`
+
+Your working directory is `~/.picoclaw/workspace/`, and you can read/write files here to store important information or accomplish tasks.
 
 ```sh
 make install
