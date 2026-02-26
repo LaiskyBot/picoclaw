@@ -8,7 +8,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -620,11 +619,11 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	}
 	if toolChannel != opts.Channel || toolChatID != opts.ChatID {
 		logger.DebugCF("agent", "Applying tool context override for current run", map[string]any{
-			"session_key":       opts.SessionKey,
-			"origin_channel":    opts.Channel,
-			"origin_chat_id":    opts.ChatID,
-			"tool_channel":      toolChannel,
-			"tool_chat_id":      toolChatID,
+			"session_key":        opts.SessionKey,
+			"origin_channel":     opts.Channel,
+			"origin_chat_id":     opts.ChatID,
+			"tool_channel":       toolChannel,
+			"tool_chat_id":       toolChatID,
 			"task_reference_len": len(delegationReference),
 		})
 	}
@@ -793,34 +792,7 @@ func (al *AgentLoop) runLLMIteration(
 	iteration := 0
 	var finalContent string
 	sawToolCalls := false
-	llmCall := func(callCtx context.Context, reqMessages []providers.Message, reqToolDefs []providers.ToolDefinition, iter int) (*providers.LLMResponse, error) {
-		callOptions := map[string]any{
-			"max_tokens":       agent.MaxTokens,
-			"temperature":      agent.Temperature,
-			"prompt_cache_key": agent.ID,
-		}
-		if len(reqToolDefs) > 0 {
-			callOptions["parallel_tool_calls"] = true
-		}
-
-		if len(agent.Candidates) > 0 && al.fallback != nil {
-			fbResult, fbErr := al.fallback.Execute(callCtx, agent.Candidates,
-				func(ctx context.Context, provider, model string) (*providers.LLMResponse, error) {
-					return agent.Provider.Chat(ctx, reqMessages, reqToolDefs, model, callOptions)
-				},
-			)
-			if fbErr != nil {
-				return nil, fbErr
-			}
-			if fbResult.Provider != "" && len(fbResult.Attempts) > 0 {
-				logger.InfoCF("agent", fmt.Sprintf("Fallback: succeeded with %s/%s after %d attempts",
-					fbResult.Provider, fbResult.Model, len(fbResult.Attempts)+1),
-					map[string]any{"agent_id": agent.ID, "iteration": iter})
-			}
-			return fbResult.Response, nil
-		}
-		return agent.Provider.Chat(callCtx, reqMessages, reqToolDefs, agent.Model, callOptions)
-	}
+	llmCall := al.buildLLMCall(agent)
 
 	for iteration < agent.MaxIterations {
 		iteration++
@@ -956,180 +928,14 @@ func (al *AgentLoop) runLLMIteration(
 		sawToolCalls = true
 
 		if iteration == agent.MaxIterations {
-			if strings.TrimSpace(response.Content) != "" {
-				logger.WarnCF("agent", "Max iterations reached with tool calls; using assistant textual content without executing tools", map[string]any{
-					"agent_id":       agent.ID,
-					"session_key":    opts.SessionKey,
-					"channel":        opts.Channel,
-					"chat_id":        opts.ChatID,
-					"max_iterations": agent.MaxIterations,
-					"content_chars":  len(strings.TrimSpace(response.Content)),
-				})
-				finalContent = response.Content
+			recoveredContent, done := al.handleMaxIterationWithToolCalls(ctx, agent, messages, opts, iteration, response, llmCall)
+			if done {
+				finalContent = recoveredContent
 				break
 			}
-
-			forcedSummary, forceErr := al.forceFinalTextAfterToolLoop(ctx, agent, messages, iteration, llmCall)
-			if forceErr != nil {
-				logger.WarnCF("agent", "Forced final textual response after tool loop exhaustion failed", map[string]any{
-					"agent_id":       agent.ID,
-					"iteration":      iteration,
-					"max_iterations": agent.MaxIterations,
-					"error":          forceErr.Error(),
-				})
-			}
-			if strings.TrimSpace(forcedSummary) != "" {
-				logger.WarnCF("agent", "Recovered textual response after tool loop exhaustion", map[string]any{
-					"agent_id":       agent.ID,
-					"session_key":    opts.SessionKey,
-					"channel":        opts.Channel,
-					"chat_id":        opts.ChatID,
-					"max_iterations": agent.MaxIterations,
-					"content_chars":  len(strings.TrimSpace(forcedSummary)),
-				})
-				finalContent = forcedSummary
-				break
-			}
-
-			logger.WarnCF("agent", "Max iterations reached with tool calls and no textual content; ending loop without executing additional tools", map[string]any{
-				"agent_id":       agent.ID,
-				"session_key":    opts.SessionKey,
-				"channel":        opts.Channel,
-				"chat_id":        opts.ChatID,
-				"max_iterations": agent.MaxIterations,
-			})
-			break
 		}
 
-		// Build assistant message with tool calls
-		assistantMsg := providers.Message{
-			Role:             "assistant",
-			Content:          response.Content,
-			ReasoningContent: response.ReasoningContent,
-		}
-		for _, tc := range normalizedToolCalls {
-			argumentsJSON, _ := json.Marshal(tc.Arguments)
-			// Copy ExtraContent to ensure thought_signature is persisted for Gemini 3
-			extraContent := tc.ExtraContent
-			thoughtSignature := ""
-			if tc.Function != nil {
-				thoughtSignature = tc.Function.ThoughtSignature
-			}
-
-			assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, providers.ToolCall{
-				ID:   tc.ID,
-				Type: "function",
-				Name: tc.Name,
-				Function: &providers.FunctionCall{
-					Name:             tc.Name,
-					Arguments:        string(argumentsJSON),
-					ThoughtSignature: thoughtSignature,
-				},
-				ExtraContent:     extraContent,
-				ThoughtSignature: thoughtSignature,
-			})
-		}
-		messages = append(messages, assistantMsg)
-
-		// Save assistant message with tool calls to session
-		agent.Sessions.AddFullMessage(opts.SessionKey, assistantMsg)
-
-		// Execute tool calls
-		for _, tc := range normalizedToolCalls {
-			argsJSON, _ := json.Marshal(tc.Arguments)
-			argsPreview := utils.Truncate(string(argsJSON), 200)
-			logger.InfoCF("agent", fmt.Sprintf("Tool call: %s(%s)", tc.Name, argsPreview),
-				map[string]any{
-					"agent_id":  agent.ID,
-					"tool":      tc.Name,
-					"iteration": iteration,
-				})
-
-			// Create async callback for tools that implement AsyncTool
-			// NOTE: Following openclaw's design, async tools do NOT send results directly to users.
-			// Instead, they notify the agent via PublishInbound, and the agent decides
-			// whether to forward the result to the user (in processSystemMessage).
-			asyncCallback := func(callbackCtx context.Context, result *tools.ToolResult) {
-				// Log the async completion but don't send directly to user
-				// The agent will handle user notification via processSystemMessage
-				if !result.Silent && result.ForUser != "" {
-					logger.InfoCF("agent", "Async tool completed, agent will handle notification",
-						map[string]any{
-							"tool":        tc.Name,
-							"content_len": len(result.ForUser),
-						})
-				}
-			}
-
-			toolExecChannel := opts.Channel
-			if strings.TrimSpace(opts.ToolChannel) != "" {
-				toolExecChannel = strings.TrimSpace(opts.ToolChannel)
-			}
-			toolExecChatID := opts.ChatID
-			if strings.TrimSpace(opts.ToolChatID) != "" {
-				toolExecChatID = strings.TrimSpace(opts.ToolChatID)
-			}
-			if toolExecChannel != opts.Channel || toolExecChatID != opts.ChatID {
-				logger.DebugCF("agent", "Executing tool with overridden target context", map[string]any{
-					"agent_id":           agent.ID,
-					"tool":               tc.Name,
-					"iteration":          iteration,
-					"origin_channel":     opts.Channel,
-					"origin_chat_id":     opts.ChatID,
-					"tool_exec_channel":  toolExecChannel,
-					"tool_exec_chat_id":  toolExecChatID,
-				})
-			}
-
-			toolResult := agent.Tools.ExecuteWithContext(
-				ctx,
-				tc.Name,
-				tc.Arguments,
-				toolExecChannel,
-				toolExecChatID,
-				asyncCallback,
-			)
-
-			// Send ForUser content to user immediately if not Silent
-			if !toolResult.Silent && toolResult.ForUser != "" && opts.SendResponse {
-				al.bus.PublishOutbound(bus.OutboundMessage{
-					Channel: opts.Channel,
-					ChatID:  opts.ChatID,
-					Content: toolResult.ForUser,
-				})
-				logger.DebugCF("agent", "Sent tool result to user",
-					map[string]any{
-						"tool":        tc.Name,
-						"content_len": len(toolResult.ForUser),
-					})
-			}
-
-			// Determine content for LLM based on tool result
-			contentForLLM := toolResult.ForLLM
-			if contentForLLM == "" && toolResult.Err != nil {
-				contentForLLM = toolResult.Err.Error()
-			}
-
-			logger.DebugCF("agent", "Tool execution output metadata", map[string]any{
-				"agent_id":         agent.ID,
-				"iteration":        iteration,
-				"tool":             tc.Name,
-				"for_llm_chars":    len(strings.TrimSpace(contentForLLM)),
-				"for_user_chars":   len(strings.TrimSpace(toolResult.ForUser)),
-				"silent":           toolResult.Silent,
-				"has_error":        toolResult.Err != nil,
-			})
-
-			toolResultMsg := providers.Message{
-				Role:       "tool",
-				Content:    contentForLLM,
-				ToolCallID: tc.ID,
-			}
-			messages = append(messages, toolResultMsg)
-
-			// Save tool result message to session
-			agent.Sessions.AddFullMessage(opts.SessionKey, toolResultMsg)
-		}
+		messages = al.appendAssistantAndExecuteToolsForIteration(ctx, agent, messages, opts, iteration, response, normalizedToolCalls)
 	}
 
 	if finalContent == "" && iteration >= agent.MaxIterations && sawToolCalls {
@@ -1143,43 +949,6 @@ func (al *AgentLoop) runLLMIteration(
 	}
 
 	return finalContent, iteration, nil
-}
-
-// forceFinalTextAfterToolLoop asks the model to return a textual answer when tool budget is exhausted.
-// The ctx parameter controls request cancellation, agent holds model/provider settings, messages is the current conversation state,
-// and iteration records the active turn for logs. The llmCall parameter performs one provider call with caller-selected tools.
-// It returns the best-effort textual response and any provider execution error.
-func (al *AgentLoop) forceFinalTextAfterToolLoop(
-	ctx context.Context,
-	agent *AgentInstance,
-	messages []providers.Message,
-	iteration int,
-	llmCall func(context.Context, []providers.Message, []providers.ToolDefinition, int) (*providers.LLMResponse, error),
-) (string, error) {
-	forcedMessages := append([]providers.Message{}, messages...)
-	forcedMessages = append(forcedMessages, providers.Message{
-		Role: "system",
-		Content: "Tool-call budget is exhausted. Do not call any tools. Provide a concise final textual answer based only on existing observations. " +
-			"If information is insufficient, clearly state the uncertainty and list what is missing.",
-	})
-
-	response, err := llmCall(ctx, forcedMessages, nil, iteration)
-	if err != nil {
-		return "", err
-	}
-	if response == nil {
-		return "", nil
-	}
-
-	logger.DebugCF("agent", "Forced final textual response metadata", map[string]any{
-		"agent_id":        agent.ID,
-		"iteration":       iteration,
-		"content_chars":   len(strings.TrimSpace(response.Content)),
-		"reasoning_chars": len(strings.TrimSpace(response.ReasoningContent)),
-		"tool_calls":      len(response.ToolCalls),
-	})
-
-	return strings.TrimSpace(response.Content), nil
 }
 
 // isContextWindowError checks whether an error indicates model context/token length overflow.
