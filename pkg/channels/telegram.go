@@ -164,20 +164,50 @@ func (c *TelegramChannel) Send(ctx context.Context, msg bus.OutboundMessage) err
 	c.stopThinkingForChat(msg.ChatID)
 
 	replyMarkup := buildTelegramInlineKeyboard(msg.Buttons)
+	content := msg.Content
+	attachments := append([]bus.OutboundAttachment(nil), msg.Attachments...)
 
-	if len(msg.Attachments) == 0 {
-		return c.sendTextResponse(ctx, chatID, msg.ChatID, msg.Content, replyMarkup)
+	if len(attachments) == 0 {
+		extractedContent, extractedAttachments := extractTelegramInlineImageAttachments(content)
+		if len(extractedAttachments) > 0 {
+			logger.DebugCF("telegram", "Extracted markdown image attachments from outbound content", map[string]any{
+				"chat_id":               msg.ChatID,
+				"extracted_count":       len(extractedAttachments),
+				"content_chars_before":  len(content),
+				"content_chars_after":   len(extractedContent),
+				"has_existing_attachments": len(msg.Attachments) > 0,
+			})
+			content = extractedContent
+			attachments = append(attachments, extractedAttachments...)
+		}
+
+		htmlExtractedContent, htmlExtractedAttachments := extractTelegramHTMLImageAttachments(content)
+		if len(htmlExtractedAttachments) > 0 {
+			logger.DebugCF("telegram", "Extracted HTML image attachments from outbound content", map[string]any{
+				"chat_id":               msg.ChatID,
+				"extracted_count":       len(htmlExtractedAttachments),
+				"content_chars_before":  len(content),
+				"content_chars_after":   len(htmlExtractedContent),
+				"has_existing_attachments": len(msg.Attachments) > 0,
+			})
+			content = htmlExtractedContent
+			attachments = append(attachments, htmlExtractedAttachments...)
+		}
 	}
 
-	if strings.TrimSpace(msg.Content) != "" || replyMarkup != nil {
-		if err = c.sendTextResponse(ctx, chatID, msg.ChatID, msg.Content, replyMarkup); err != nil {
+	if len(attachments) == 0 {
+		return c.sendTextResponse(ctx, chatID, msg.ChatID, content, replyMarkup)
+	}
+
+	if strings.TrimSpace(content) != "" || replyMarkup != nil {
+		if err = c.sendTextResponse(ctx, chatID, msg.ChatID, content, replyMarkup); err != nil {
 			return err
 		}
 	} else {
 		c.clearThinkingPlaceholder(msg.ChatID)
 	}
 
-	for idx, attachment := range msg.Attachments {
+	for idx, attachment := range attachments {
 		if err = c.sendAttachment(ctx, chatID, attachment); err != nil {
 			return fmt.Errorf("send attachment[%d]: %w", idx, err)
 		}
@@ -185,8 +215,8 @@ func (c *TelegramChannel) Send(ctx context.Context, msg bus.OutboundMessage) err
 
 	logger.InfoCF("telegram", "Sent rich response", map[string]any{
 		"chat_id":        msg.ChatID,
-		"content_chars":  len(msg.Content),
-		"attachment_count": len(msg.Attachments),
+		"content_chars":  len(content),
+		"attachment_count": len(attachments),
 		"button_count":   len(msg.Buttons),
 	})
 
@@ -253,11 +283,13 @@ func (c *TelegramChannel) sendTextResponse(
 		logger.WarnCF("telegram", "HTML parse failed, retrying plain text", map[string]any{
 			"chat_id":              chatIDStr,
 			"reply_markup_present": replyMarkup != nil,
+			"content_chars":        len(content),
 			"error":                err.Error(),
 		})
 		logger.DebugCF("telegram", "Telegram HTML payload preview", map[string]any{
 			"chat_id":       chatIDStr,
 			"content_chars": len(content),
+			"text_preview":  utils.Truncate(content, 512),
 			"html_preview":  utils.Truncate(htmlContent, 512),
 		})
 		tgMsg.ParseMode = ""
@@ -731,6 +763,168 @@ func parseChatID(chatIDStr string) (int64, error) {
 	var id int64
 	_, err := fmt.Sscanf(chatIDStr, "%d", &id)
 	return id, err
+}
+
+// extractTelegramInlineImageAttachments extracts markdown image tokens as outbound Telegram photo attachments.
+// It accepts outbound text content and returns cleaned text plus extracted attachments.
+func extractTelegramInlineImageAttachments(content string) (string, []bus.OutboundAttachment) {
+	if strings.TrimSpace(content) == "" {
+		return content, nil
+	}
+
+	re := regexp.MustCompile(`!\[([^\]]*)\]\(([^)\s]+)\)`)
+	indices := re.FindAllStringSubmatchIndex(content, -1)
+	if len(indices) == 0 {
+		return content, nil
+	}
+
+	attachments := make([]bus.OutboundAttachment, 0, len(indices))
+	var builder strings.Builder
+	last := 0
+
+	for _, idx := range indices {
+		if len(idx) < 6 {
+			continue
+		}
+
+		start := idx[0]
+		end := idx[1]
+		altStart := idx[2]
+		altEnd := idx[3]
+		srcStart := idx[4]
+		srcEnd := idx[5]
+
+		builder.WriteString(content[last:start])
+
+		altText := strings.TrimSpace(content[altStart:altEnd])
+		source := strings.TrimSpace(content[srcStart:srcEnd])
+		attachment, ok := markdownImageToOutboundAttachment(source, altText)
+		if ok {
+			attachments = append(attachments, attachment)
+		} else {
+			builder.WriteString(content[start:end])
+		}
+
+		last = end
+	}
+
+	builder.WriteString(content[last:])
+	cleaned := strings.TrimSpace(builder.String())
+	if len(attachments) == 0 {
+		return content, nil
+	}
+
+	return cleaned, attachments
+}
+
+// extractTelegramHTMLImageAttachments extracts HTML img tags as outbound Telegram photo attachments.
+// It accepts outbound text content and returns cleaned text plus extracted attachments.
+func extractTelegramHTMLImageAttachments(content string) (string, []bus.OutboundAttachment) {
+	if strings.TrimSpace(content) == "" {
+		return content, nil
+	}
+
+	re := regexp.MustCompile(`(?i)<img\b[^>]*>`) // #nosec G101 -- static regex only
+	srcRe := regexp.MustCompile(`(?i)\bsrc\s*=\s*"([^"]*)"|\bsrc\s*=\s*'([^']*)'`)
+	altRe := regexp.MustCompile(`(?i)\balt\s*=\s*"([^"]*)"|\balt\s*=\s*'([^']*)'`)
+	indices := re.FindAllStringIndex(content, -1)
+	if len(indices) == 0 {
+		return content, nil
+	}
+
+	attachments := make([]bus.OutboundAttachment, 0, len(indices))
+	var builder strings.Builder
+	last := 0
+
+	for _, idx := range indices {
+		if len(idx) < 2 {
+			continue
+		}
+
+		start := idx[0]
+		end := idx[1]
+		tag := content[start:end]
+
+		builder.WriteString(content[last:start])
+
+		source := firstNonEmptySubmatch(srcRe.FindStringSubmatch(tag))
+		caption := firstNonEmptySubmatch(altRe.FindStringSubmatch(tag))
+
+		attachment, ok := markdownImageToOutboundAttachment(source, caption)
+		if ok {
+			attachments = append(attachments, attachment)
+		} else {
+			builder.WriteString(tag)
+		}
+
+		last = end
+	}
+
+	builder.WriteString(content[last:])
+	cleaned := strings.TrimSpace(builder.String())
+	if len(attachments) == 0 {
+		return content, nil
+	}
+
+	return cleaned, attachments
+}
+
+// firstNonEmptySubmatch returns the first non-empty capturing group from regex submatches.
+// It accepts full FindStringSubmatch output and returns the first non-empty group value.
+func firstNonEmptySubmatch(matches []string) string {
+	if len(matches) < 2 {
+		return ""
+	}
+
+	for _, item := range matches[1:] {
+		trimmed := strings.TrimSpace(item)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+
+	return ""
+}
+
+// markdownImageToOutboundAttachment converts one markdown image source into an outbound attachment.
+// It accepts image source and caption text, then returns a normalized attachment and conversion flag.
+func markdownImageToOutboundAttachment(source, caption string) (bus.OutboundAttachment, bool) {
+	if source == "" {
+		return bus.OutboundAttachment{}, false
+	}
+
+	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
+		return bus.OutboundAttachment{
+			Type:    "photo",
+			URL:     source,
+			Caption: caption,
+		}, true
+	}
+
+	if strings.HasPrefix(source, "file://") {
+		parsed, err := url.Parse(source)
+		if err != nil {
+			return bus.OutboundAttachment{}, false
+		}
+		unescapedPath, err := url.PathUnescape(parsed.EscapedPath())
+		if err != nil {
+			return bus.OutboundAttachment{}, false
+		}
+		if strings.TrimSpace(unescapedPath) == "" {
+			return bus.OutboundAttachment{}, false
+		}
+		return bus.OutboundAttachment{
+			Type:    "photo",
+			Path:    unescapedPath,
+			Caption: caption,
+		}, true
+	}
+
+	return bus.OutboundAttachment{
+		Type:    "photo",
+		Path:    source,
+		Caption: caption,
+	}, true
 }
 
 func markdownToTelegramHTML(text string) string {
