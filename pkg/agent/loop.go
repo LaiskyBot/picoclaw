@@ -616,6 +616,16 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	if strings.TrimSpace(opts.ToolChatID) != "" {
 		toolChatID = strings.TrimSpace(opts.ToolChatID)
 	}
+	if toolChannel != opts.Channel || toolChatID != opts.ChatID {
+		logger.DebugCF("agent", "Applying tool context override for current run", map[string]any{
+			"session_key":       opts.SessionKey,
+			"origin_channel":    opts.Channel,
+			"origin_chat_id":    opts.ChatID,
+			"tool_channel":      toolChannel,
+			"tool_chat_id":      toolChatID,
+			"task_reference_len": len(delegationReference),
+		})
+	}
 	al.updateToolContexts(agent, toolChannel, toolChatID, delegationReference)
 
 	// 3. Build messages
@@ -973,12 +983,32 @@ func (al *AgentLoop) runLLMIteration(
 				}
 			}
 
+			toolExecChannel := opts.Channel
+			if strings.TrimSpace(opts.ToolChannel) != "" {
+				toolExecChannel = strings.TrimSpace(opts.ToolChannel)
+			}
+			toolExecChatID := opts.ChatID
+			if strings.TrimSpace(opts.ToolChatID) != "" {
+				toolExecChatID = strings.TrimSpace(opts.ToolChatID)
+			}
+			if toolExecChannel != opts.Channel || toolExecChatID != opts.ChatID {
+				logger.DebugCF("agent", "Executing tool with overridden target context", map[string]any{
+					"agent_id":           agent.ID,
+					"tool":               tc.Name,
+					"iteration":          iteration,
+					"origin_channel":     opts.Channel,
+					"origin_chat_id":     opts.ChatID,
+					"tool_exec_channel":  toolExecChannel,
+					"tool_exec_chat_id":  toolExecChatID,
+				})
+			}
+
 			toolResult := agent.Tools.ExecuteWithContext(
 				ctx,
 				tc.Name,
 				tc.Arguments,
-				opts.Channel,
-				opts.ChatID,
+				toolExecChannel,
+				toolExecChatID,
 				asyncCallback,
 			)
 

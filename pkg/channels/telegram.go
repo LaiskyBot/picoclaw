@@ -158,6 +158,14 @@ func (c *TelegramChannel) Send(ctx context.Context, msg bus.OutboundMessage) err
 
 	chatID, err := parseChatID(msg.ChatID)
 	if err != nil {
+		logger.DebugCF("telegram", "Rejected outbound message due to non-numeric chat ID", map[string]any{
+			"channel":          msg.Channel,
+			"chat_id":          msg.ChatID,
+			"content_chars":    len(msg.Content),
+			"attachment_count": len(msg.Attachments),
+			"button_count":     len(msg.Buttons),
+			"error":            err.Error(),
+		})
 		return fmt.Errorf("invalid chat ID: %w", err)
 	}
 

@@ -389,3 +389,98 @@ func TestMessageTool_Execute_KeepExplicitExternalTarget(t *testing.T) {
 		t.Fatalf("expected explicit chat id to be preserved, got %s", sent.ChatID)
 	}
 }
+
+func TestMessageTool_Execute_RemapPipelineTaskIDWithExplicitTelegramChannel(t *testing.T) {
+	tool := NewMessageTool()
+	tool.SetContext("telegram", "861999008")
+
+	var sent bus.OutboundMessage
+	tool.SetSendCallback(func(msg bus.OutboundMessage) error {
+		sent = msg
+		return nil
+	})
+
+	result := tool.Execute(context.Background(), map[string]any{
+		"content": "Send screenshots",
+		"channel": "telegram",
+		"chat_id": "task-2026-02-26-0037",
+		"attachments": []any{
+			map[string]any{
+				"type": "photo",
+				"path": "/tmp/screenshot.png",
+			},
+		},
+	})
+
+	if result.IsError {
+		t.Fatalf("expected success, got error: %s", result.ForLLM)
+	}
+	if sent.Channel != "telegram" {
+		t.Fatalf("expected channel telegram, got %s", sent.Channel)
+	}
+	if sent.ChatID != "861999008" {
+		t.Fatalf("expected chat id remapped to contextual target, got %s", sent.ChatID)
+	}
+}
+
+func TestMessageTool_Execute_RejectPipelineTaskIDOnTelegramWithoutSafeFallback(t *testing.T) {
+	tool := NewMessageTool()
+	tool.SetContext("planner_task", "task-2026-02-26-0037")
+
+	called := false
+	tool.SetSendCallback(func(msg bus.OutboundMessage) error {
+		called = true
+		return nil
+	})
+
+	result := tool.Execute(context.Background(), map[string]any{
+		"content": "Send screenshots",
+		"channel": "telegram",
+		"chat_id": "task-2026-02-26-0037",
+	})
+
+	if !result.IsError {
+		t.Fatal("expected error for unroutable telegram task chat_id")
+	}
+	if called {
+		t.Fatal("send callback should not be called when chat_id is invalid")
+	}
+	if result.Err == nil {
+		t.Fatal("expected error object to be present")
+	}
+}
+
+func TestMessageTool_Execute_RemapPipelineTaskIDForTelegramButtons(t *testing.T) {
+	tool := NewMessageTool()
+	tool.SetContext("telegram", "861999008")
+
+	var sent bus.OutboundMessage
+	tool.SetSendCallback(func(msg bus.OutboundMessage) error {
+		sent = msg
+		return nil
+	})
+
+	result := tool.Execute(context.Background(), map[string]any{
+		"content": "Here are some demo buttons you can press:",
+		"channel": "telegram",
+		"chat_id": "task-2026-02-26-0038",
+		"buttons": []any{
+			map[string]any{"text": "Button 1", "callback_data": "demo_btn_1", "row": float64(0)},
+			map[string]any{"text": "Button 2", "callback_data": "demo_btn_2", "row": float64(0)},
+			map[string]any{"text": "Button 3", "callback_data": "demo_btn_3", "row": float64(1)},
+		},
+	})
+
+	if result.IsError {
+		t.Fatalf("expected success, got error: %s", result.ForLLM)
+	}
+	if sent.Channel != "telegram" {
+		t.Fatalf("expected channel telegram, got %s", sent.Channel)
+	}
+	if sent.ChatID != "861999008" {
+		t.Fatalf("expected chat id remapped to contextual target, got %s", sent.ChatID)
+	}
+	if len(sent.Buttons) != 3 {
+		t.Fatalf("expected 3 buttons, got %d", len(sent.Buttons))
+	}
+}

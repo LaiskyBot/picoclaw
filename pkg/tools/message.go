@@ -137,6 +137,9 @@ func (t *MessageTool) Execute(ctx context.Context, args map[string]any) *ToolRes
 	requestedChannel, _ := args["channel"].(string)
 	requestedChatID, _ := args["chat_id"].(string)
 	channel, chatID := t.resolveTarget(requestedChannel, requestedChatID)
+	if err := validateMessageTarget(channel, chatID); err != nil {
+		return &ToolResult{ForLLM: err.Error(), IsError: true, Err: err}
+	}
 
 	if channel == "" || chatID == "" {
 		return &ToolResult{ForLLM: "No target channel/chat specified", IsError: true}
@@ -193,6 +196,17 @@ func (t *MessageTool) resolveTarget(requestedChannel, requestedChatID string) (s
 		chatID = strings.TrimSpace(t.defaultChatID)
 	}
 
+	if channel != "" {
+		logger.DebugCF("tool", "Message tool resolved outbound target before remap", map[string]any{
+			"requested_channel": requestedChannel,
+			"requested_chat_id": requestedChatID,
+			"resolved_channel":  channel,
+			"resolved_chat_id":  chatID,
+			"default_channel":   strings.TrimSpace(t.defaultChannel),
+			"default_chat_id":   strings.TrimSpace(t.defaultChatID),
+		})
+	}
+
 	if !t.shouldRemapToDefaultTarget(channel, chatID, requestedChannel, requestedChatID) {
 		return channel, chatID
 	}
@@ -234,7 +248,33 @@ func (t *MessageTool) shouldRemapToDefaultTarget(channel, chatID, requestedChann
 		return true
 	}
 
+	if strings.EqualFold(strings.TrimSpace(channel), "telegram") &&
+		looksLikePipelineTaskID(strings.TrimSpace(chatID)) &&
+		strings.EqualFold(strings.TrimSpace(defaultChannel), "telegram") &&
+		!looksLikePipelineTaskID(strings.TrimSpace(defaultChatID)) {
+		return true
+	}
+
 	return false
+}
+
+// validateMessageTarget ensures outbound message target is routable for external channels.
+// The channel and chatID parameters are normalized outbound destination values.
+// It returns an error when target appears to be an internal pipeline identifier leak.
+func validateMessageTarget(channel, chatID string) error {
+	resolvedChannel := strings.TrimSpace(channel)
+	resolvedChatID := strings.TrimSpace(chatID)
+	if resolvedChannel == "" || resolvedChatID == "" {
+		return nil
+	}
+	if constants.IsInternalChannel(resolvedChannel) {
+		return nil
+	}
+	if strings.EqualFold(resolvedChannel, "telegram") && looksLikePipelineTaskID(resolvedChatID) {
+		return fmt.Errorf("invalid chat_id for telegram: pipeline task ID is not routable; omit chat_id to use current chat context")
+	}
+
+	return nil
 }
 
 // looksLikePipelineTaskID reports whether chat ID follows persisted task pipeline identifier format.

@@ -644,8 +644,11 @@ type mockContextualTool struct {
 
 // mockMessageContextTool tracks context updates for the message tool slot.
 type mockMessageContextTool struct {
-	lastChannel string
-	lastChatID  string
+	lastChannel      string
+	lastChatID       string
+	execChannel      string
+	execChatID       string
+	executeCallCount int
 }
 
 func (m *mockContextualTool) Name() string {
@@ -697,6 +700,9 @@ func (m *mockMessageContextTool) Parameters() map[string]any {
 // The ctx and args parameters are ignored in this test implementation.
 // It returns a successful silent tool result.
 func (m *mockMessageContextTool) Execute(ctx context.Context, args map[string]any) *tools.ToolResult {
+	m.execChannel = m.lastChannel
+	m.execChatID = m.lastChatID
+	m.executeCallCount++
 	return tools.SilentResult("ok")
 }
 
@@ -763,6 +769,232 @@ func TestRunAgentLoop_UsesToolContextOverrides(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "telegram", messageTool.lastChannel)
 	require.Equal(t, "861999008", messageTool.lastChatID)
+}
+
+type oneToolCallThenDoneProvider struct {
+	called int
+}
+
+// Chat returns one message tool call on first turn, then a final textual response.
+// The messages, tools, model, and opts parameters are accepted to satisfy the provider contract.
+// It returns a deterministic response sequence for tool-context regression tests.
+func (m *oneToolCallThenDoneProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	m.called++
+	if m.called == 1 {
+		return &providers.LLMResponse{
+			ToolCalls: []providers.ToolCall{
+				{
+					ID:   "tool-1",
+					Type: "function",
+					Name: "message",
+					Arguments: map[string]any{
+						"content": "hello",
+					},
+				},
+			},
+		}, nil
+	}
+
+	return &providers.LLMResponse{Content: "done"}, nil
+}
+
+// GetDefaultModel returns the provider's static default model identifier.
+// It accepts no parameters and returns a deterministic value.
+func (m *oneToolCallThenDoneProvider) GetDefaultModel() string {
+	return "mock-model"
+}
+
+type fixedToolCallThenDoneProvider struct {
+	called   int
+	toolCall providers.ToolCall
+}
+
+// Chat returns the configured tool call on first turn, then a final textual response.
+// The parameters satisfy provider contract and are not otherwise used in this test provider.
+// It returns deterministic responses to validate planner-to-message behavior.
+func (m *fixedToolCallThenDoneProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	m.called++
+	if m.called == 1 {
+		return &providers.LLMResponse{ToolCalls: []providers.ToolCall{m.toolCall}}, nil
+	}
+
+	return &providers.LLMResponse{Content: "done"}, nil
+}
+
+// GetDefaultModel returns a static model identifier for this test provider.
+// It accepts no parameters and always returns a deterministic model name.
+func (m *fixedToolCallThenDoneProvider) GetDefaultModel() string {
+	return "mock-model"
+}
+
+// TestRunAgentLoop_ExecutesToolCallsWithOverrideContext verifies execution-time contextual injection
+// uses ToolChannel/ToolChatID instead of internal planner channel/task identifiers.
+// It runs one real tool-call turn and asserts the message tool observed external Telegram context in Execute.
+func TestRunAgentLoop_ExecutesToolCallsWithOverrideContext(t *testing.T) {
+	tmpDir := t.TempDir()
+	provider := &oneToolCallThenDoneProvider{}
+	messageTool := &mockMessageContextTool{}
+
+	agentInstance := &AgentInstance{
+		ID:             "main",
+		Model:          "test-model",
+		MaxIterations:  2,
+		MaxTokens:      1024,
+		Temperature:    0,
+		Provider:       provider,
+		Sessions:       session.NewSessionManager(filepath.Join(tmpDir, "sessions")),
+		ContextBuilder: NewContextBuilder(tmpDir),
+		Tools:          tools.NewToolRegistry(),
+	}
+	agentInstance.Tools.Register(messageTool)
+
+	al := &AgentLoop{bus: bus.NewMessageBus()}
+	_, err := al.runAgentLoop(context.Background(), agentInstance, processOptions{
+		SessionKey:      "agent:main:pipeline:task-2026-02-26-0037",
+		Channel:         plannerTaskChannel,
+		ChatID:          "task-2026-02-26-0037",
+		ToolChannel:     "telegram",
+		ToolChatID:      "861999008",
+		UserMessage:     "send screenshot",
+		DefaultResponse: "empty",
+		EnableSummary:   false,
+		SendResponse:    false,
+		NoHistory:       true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, messageTool.executeCallCount)
+	require.Equal(t, "telegram", messageTool.execChannel)
+	require.Equal(t, "861999008", messageTool.execChatID)
+}
+
+// TestRunAgentLoop_Behavior_RemapsPipelineTaskIDForTelegramAttachments verifies end-to-end planner behavior
+// where model emits Telegram channel plus leaked task chat ID while sending attachments.
+// It ensures outbound delivery still targets user chat injected by ToolChannel/ToolChatID overrides.
+func TestRunAgentLoop_Behavior_RemapsPipelineTaskIDForTelegramAttachments(t *testing.T) {
+	tmpDir := t.TempDir()
+	provider := &fixedToolCallThenDoneProvider{toolCall: providers.ToolCall{
+		ID:   "tool-attachment-1",
+		Type: "function",
+		Name: "message",
+		Arguments: map[string]any{
+			"content": "Here are your screenshots",
+			"channel": "telegram",
+			"chat_id": "task-2026-02-26-0037",
+			"attachments": []any{
+				map[string]any{"type": "photo", "path": "/tmp/a.png"},
+			},
+		},
+	}}
+
+	var sent bus.OutboundMessage
+	messageTool := tools.NewMessageTool()
+	messageTool.SetSendCallback(func(msg bus.OutboundMessage) error {
+		sent = msg
+		return nil
+	})
+
+	agentInstance := &AgentInstance{
+		ID:             "main",
+		Model:          "test-model",
+		MaxIterations:  2,
+		MaxTokens:      1024,
+		Temperature:    0,
+		Provider:       provider,
+		Sessions:       session.NewSessionManager(filepath.Join(tmpDir, "sessions")),
+		ContextBuilder: NewContextBuilder(tmpDir),
+		Tools:          tools.NewToolRegistry(),
+	}
+	agentInstance.Tools.Register(messageTool)
+
+	al := &AgentLoop{bus: bus.NewMessageBus()}
+	_, err := al.runAgentLoop(context.Background(), agentInstance, processOptions{
+		SessionKey:      "agent:main:pipeline:task-2026-02-26-0037",
+		Channel:         plannerTaskChannel,
+		ChatID:          "task-2026-02-26-0037",
+		ToolChannel:     "telegram",
+		ToolChatID:      "861999008",
+		UserMessage:     "send screenshots",
+		DefaultResponse: "empty",
+		EnableSummary:   false,
+		SendResponse:    false,
+		NoHistory:       true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "telegram", sent.Channel)
+	require.Equal(t, "861999008", sent.ChatID)
+	require.Len(t, sent.Attachments, 1)
+}
+
+// TestRunAgentLoop_Behavior_RemapsPipelineTaskIDForTelegramButtons verifies end-to-end planner behavior
+// where model emits Telegram buttons with leaked task chat ID.
+// It ensures outbound delivery targets user chat and keeps all button payloads.
+func TestRunAgentLoop_Behavior_RemapsPipelineTaskIDForTelegramButtons(t *testing.T) {
+	tmpDir := t.TempDir()
+	provider := &fixedToolCallThenDoneProvider{toolCall: providers.ToolCall{
+		ID:   "tool-button-1",
+		Type: "function",
+		Name: "message",
+		Arguments: map[string]any{
+			"content": "Here are some demo buttons you can press:",
+			"channel": "telegram",
+			"chat_id": "task-2026-02-26-0038",
+			"buttons": []any{
+				map[string]any{"text": "Button 1", "callback_data": "demo_btn_1", "row": float64(0)},
+				map[string]any{"text": "Button 2", "callback_data": "demo_btn_2", "row": float64(0)},
+				map[string]any{"text": "Button 3", "callback_data": "demo_btn_3", "row": float64(1)},
+			},
+		},
+	}}
+
+	var sent bus.OutboundMessage
+	messageTool := tools.NewMessageTool()
+	messageTool.SetSendCallback(func(msg bus.OutboundMessage) error {
+		sent = msg
+		return nil
+	})
+
+	agentInstance := &AgentInstance{
+		ID:             "main",
+		Model:          "test-model",
+		MaxIterations:  2,
+		MaxTokens:      1024,
+		Temperature:    0,
+		Provider:       provider,
+		Sessions:       session.NewSessionManager(filepath.Join(tmpDir, "sessions")),
+		ContextBuilder: NewContextBuilder(tmpDir),
+		Tools:          tools.NewToolRegistry(),
+	}
+	agentInstance.Tools.Register(messageTool)
+
+	al := &AgentLoop{bus: bus.NewMessageBus()}
+	_, err := al.runAgentLoop(context.Background(), agentInstance, processOptions{
+		SessionKey:      "agent:main:pipeline:task-2026-02-26-0038",
+		Channel:         plannerTaskChannel,
+		ChatID:          "task-2026-02-26-0038",
+		ToolChannel:     "telegram",
+		ToolChatID:      "861999008",
+		UserMessage:     "send buttons",
+		DefaultResponse: "empty",
+		EnableSummary:   false,
+		SendResponse:    false,
+		NoHistory:       true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "telegram", sent.Channel)
+	require.Equal(t, "861999008", sent.ChatID)
+	require.Len(t, sent.Buttons, 3)
 }
 
 // TestRunAgentLoop_SanitizesSyntheticMediaMarkerWithoutMessageSend verifies fake media markers are not forwarded to users.
