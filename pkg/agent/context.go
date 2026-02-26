@@ -106,8 +106,10 @@ Your workspace is at: %s
 
 8. **Memory** - When interacting with me if something seems memorable, update %s/memory/MEMORY.md
 
-9. **Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.`,
-		workspacePath, workspacePath, workspacePath, workspacePath, workspacePath)
+9. **Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.
+
+10. **Output length control** - %s`,
+		workspacePath, workspacePath, workspacePath, workspacePath, workspacePath, promptLengthControlHint)
 }
 
 func (cb *ContextBuilder) BuildSystemPrompt() string {

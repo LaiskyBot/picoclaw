@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/config"
@@ -586,15 +587,15 @@ func TestRunAgentLoop_UsesToolContextOverrides(t *testing.T) {
 	messageTool := &mockMessageContextTool{}
 
 	agentInstance := &AgentInstance{
-		ID:            "main",
-		Model:         "test-model",
-		MaxIterations: 1,
-		MaxTokens:     1024,
-		Temperature:   0,
-		Provider:      provider,
-		Sessions:      session.NewSessionManager(filepath.Join(tmpDir, "sessions")),
+		ID:             "main",
+		Model:          "test-model",
+		MaxIterations:  1,
+		MaxTokens:      1024,
+		Temperature:    0,
+		Provider:       provider,
+		Sessions:       session.NewSessionManager(filepath.Join(tmpDir, "sessions")),
 		ContextBuilder: NewContextBuilder(tmpDir),
-		Tools:         tools.NewToolRegistry(),
+		Tools:          tools.NewToolRegistry(),
 	}
 	agentInstance.Tools.Register(messageTool)
 
@@ -625,15 +626,15 @@ func TestRunAgentLoop_SanitizesSyntheticMediaMarkerWithoutMessageSend(t *testing
 	msgBus := bus.NewMessageBus()
 
 	agentInstance := &AgentInstance{
-		ID:            "main",
-		Model:         "test-model",
-		MaxIterations: 1,
-		MaxTokens:     1024,
-		Temperature:   0,
-		Provider:      provider,
-		Sessions:      session.NewSessionManager(filepath.Join(tmpDir, "sessions")),
+		ID:             "main",
+		Model:          "test-model",
+		MaxIterations:  1,
+		MaxTokens:      1024,
+		Temperature:    0,
+		Provider:       provider,
+		Sessions:       session.NewSessionManager(filepath.Join(tmpDir, "sessions")),
 		ContextBuilder: NewContextBuilder(tmpDir),
-		Tools:         tools.NewToolRegistry(),
+		Tools:          tools.NewToolRegistry(),
 	}
 	agentInstance.Tools.Register(tools.NewMessageTool())
 
@@ -772,6 +773,45 @@ func (m *failFirstMockProvider) GetDefaultModel() string {
 	return "mock-fail-model"
 }
 
+// overflowRecoveryMockProvider simulates context overflow on the first main call.
+// It also handles emergency compression prompts and then succeeds on retry.
+type overflowRecoveryMockProvider struct {
+	mainCalls          int
+	compressionCalls   int
+	compressionSummary string
+	compressed         bool
+}
+
+// Chat returns context overflow for the first main call, handles compression prompt,
+// and then returns a successful direct answer on retry.
+// The messages parameter is inspected by marker text and tools is used to detect main calls.
+func (m *overflowRecoveryMockProvider) Chat(
+	_ context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	_ string,
+	_ map[string]any,
+) (*providers.LLMResponse, error) {
+	if len(tools) == 0 && len(messages) >= 2 && strings.Contains(messages[1].Content, "EMERGENCY_CONTEXT_COMPRESSION") {
+		m.compressionCalls++
+		m.compressed = true
+		return &providers.LLMResponse{Content: m.compressionSummary}, nil
+	}
+
+	m.mainCalls++
+	if !m.compressed {
+		return nil, fmt.Errorf("context_length_exceeded: Please reduce the length of the messages or completion")
+	}
+
+	return &providers.LLMResponse{Content: "Recovered after emergency compression"}, nil
+}
+
+// GetDefaultModel returns deterministic mock model name.
+// The method takes no parameters and always returns a static string.
+func (m *overflowRecoveryMockProvider) GetDefaultModel() string {
+	return "mock-overflow-model"
+}
+
 // TestAgentLoop_ContextExhaustionRetry verify that the agent retries on context errors
 func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "agent-test-*")
@@ -851,6 +891,64 @@ func TestAgentLoop_ContextExhaustionRetry(t *testing.T) {
 	// Without compression: 6 + 1 (new user msg) + 1 (assistant msg) = 8
 	if len(finalHistory) >= 8 {
 		t.Errorf("Expected history to be compressed (len < 8), got %d", len(finalHistory))
+	}
+}
+
+// TestAgentLoop_ContextExhaustionRetry_UsesEmergencyLLMCompression verifies overflow
+// handling can recover by requesting a bounded memory summary and trimming oversized history.
+// The test creates very large tool output in history and asserts recovery path behavior.
+func TestAgentLoop_ContextExhaustionRetry_UsesEmergencyLLMCompression(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-test-overflow-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &overflowRecoveryMockProvider{compressionSummary: "compressed memory summary with key goals and pending steps"}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	defaultAgent := al.registry.GetDefaultAgent()
+	require.NotNil(t, defaultAgent)
+
+	largeToolOutput := strings.Repeat("<html>very large tool output block</html>", 900)
+	sessionKey := "agent:main:main"
+	defaultAgent.Sessions.SetHistory(sessionKey, []providers.Message{
+		{Role: "user", Content: "Need article analysis"},
+		{Role: "assistant", Content: "Fetching page..."},
+		{Role: "tool", Content: largeToolOutput},
+		{Role: "assistant", Content: "Fetched a lot of content"},
+		{Role: "tool", Content: largeToolOutput},
+	})
+
+	response, runErr := al.ProcessDirectWithChannel(
+		context.Background(),
+		"Please summarize the article and keep key points only.",
+		"test-overflow-recovery",
+		"test",
+		"chat-overflow",
+	)
+	require.NoError(t, runErr)
+	require.Equal(t, "Recovered after emergency compression", response)
+	require.GreaterOrEqual(t, provider.mainCalls, 2)
+	require.GreaterOrEqual(t, provider.compressionCalls, 1)
+
+	summary := defaultAgent.Sessions.GetSummary(sessionKey)
+	require.Contains(t, summary, "compressed memory summary")
+
+	history := defaultAgent.Sessions.GetHistory(sessionKey)
+	require.LessOrEqual(t, len(history), 5)
+	for _, msg := range history {
+		require.LessOrEqual(t, utf8.RuneCountInString(msg.Content), 1300)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
+	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/providers"
 	"github.com/sipeed/picoclaw/pkg/utils"
 )
@@ -201,6 +202,55 @@ func (al *AgentLoop) publishTaskFinalReport(taskID, plannerSummary string, runEr
 		ChatID:  task.ChatID,
 		Content: report,
 	})
+	al.recordDelegatedTaskResult(task, report)
+}
+
+// recordDelegatedTaskResult appends delegated task final report into the routed conversation session.
+// The task parameter carries routed conversation metadata and report is the user-visible final summary.
+// It returns no value.
+func (al *AgentLoop) recordDelegatedTaskResult(task *PipelineTask, report string) {
+	if task == nil || al.registry == nil {
+		return
+	}
+
+	agentID := strings.TrimSpace(task.ConversationAgentID)
+	sessionKey := strings.TrimSpace(task.ConversationSessionKey)
+	if agentID == "" || sessionKey == "" {
+		logger.DebugCF("agent", "Skip delegated task session write: missing conversation context", map[string]any{
+			"task_id":      task.ID,
+			"has_agent_id": agentID != "",
+			"has_session":  sessionKey != "",
+		})
+		return
+	}
+
+	agent, ok := al.registry.GetAgent(agentID)
+	if !ok {
+		logger.DebugCF("agent", "Skip delegated task session write: routed agent not found", map[string]any{
+			"task_id":     task.ID,
+			"agent_id":    agentID,
+			"session_key": sessionKey,
+		})
+		return
+	}
+
+	agent.Sessions.AddMessage(sessionKey, "assistant", report)
+	if err := agent.Sessions.Save(sessionKey); err != nil {
+		logger.DebugCF("agent", "Failed to persist delegated task final report into session", map[string]any{
+			"task_id":     task.ID,
+			"agent_id":    agentID,
+			"session_key": sessionKey,
+			"error":       err.Error(),
+		})
+		return
+	}
+
+	logger.DebugCF("agent", "Persisted delegated task final report into routed session", map[string]any{
+		"task_id":      task.ID,
+		"agent_id":     agentID,
+		"session_key":  sessionKey,
+		"report_chars": len(report),
+	})
 }
 
 // formatTaskFinalReport renders a concise task lifecycle summary for users.
@@ -299,8 +349,8 @@ func (al *AgentLoop) generateTaskSummary(ctx context.Context, request string) st
 	}
 
 	resp, err := planner.Provider.Chat(ctx, []providers.Message{
-		{Role: "system", Content: "You generate concise task briefs for tracking. Keep the same language as the user request. Output must be plain text only, no markdown, no quotes, no secrets, no URLs, no emails, no tokens, and no long numbers."},
-		{Role: "user", Content: "Write a very short task brief for this request. Keep the user's language and summarize the goal in <= 24 characters:\n" + request},
+		{Role: "system", Content: "You generate concise task briefs for tracking. Keep the same language as the user request. Output must be plain text only, no markdown, no quotes, no secrets, no URLs, no emails, no tokens, and no long numbers. " + promptLengthControlHint},
+		{Role: "user", Content: "Write a very short task brief for this request. Keep the user's language and summarize the goal in <= 24 characters:\n" + request + "\n" + promptLengthControlHint},
 	}, nil, planner.Model, map[string]any{
 		"max_tokens":  64,
 		"temperature": 0,
@@ -449,6 +499,9 @@ func (al *AgentLoop) decideTaskSchedule(
 	prompt.WriteString("Decide scheduling mode for the new task in an existing task pipeline.\n")
 	prompt.WriteString("Return only strict JSON with keys: decision, reason, depends_on, question.\n")
 	prompt.WriteString("Allowed decision values: parallel, wait, ask_user.\n")
+	prompt.WriteString("Keep reason/question concise and avoid long quotations from user text.\n")
+	prompt.WriteString(promptLengthControlHint)
+	prompt.WriteString("\n")
 	prompt.WriteString("Use ask_user only when dependency cannot be inferred from text.\n\n")
 	prompt.WriteString("Current task status:\n")
 	prompt.WriteString(statusSummary)
@@ -456,7 +509,7 @@ func (al *AgentLoop) decideTaskSchedule(
 	prompt.WriteString(msg.Content)
 
 	resp, err := planner.Provider.Chat(ctx, []providers.Message{
-		{Role: "system", Content: "You classify pipeline scheduling decisions. Output JSON only."},
+		{Role: "system", Content: "You classify pipeline scheduling decisions. Output JSON only. " + promptLengthControlHint},
 		{Role: "user", Content: prompt.String()},
 	}, nil, planner.Model, map[string]any{
 		"max_tokens":  300,
@@ -597,6 +650,8 @@ func buildPlannerDelegationPrompt(task *PipelineTask) string {
 	sb.WriteString("Do not output placeholders such as [Sending image] without a successful attachment send.\n")
 	sb.WriteString("When spawning workers, include enough context, explicit objective, acceptance criteria, and a concise label.\n")
 	sb.WriteString("Always produce a concise final summary with outcome and any next action.\n\n")
+	sb.WriteString(promptLengthControlHint)
+	sb.WriteString("\n\n")
 	sb.WriteString("User request:\n")
 	sb.WriteString(task.Request)
 

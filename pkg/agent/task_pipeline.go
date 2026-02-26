@@ -7,8 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,27 +41,29 @@ var statusQueryURLPattern = regexp.MustCompile(`https?://\S+`)
 // PipelineTask stores the end-to-end state of a delegated background task.
 // It includes user origin metadata, planner execution status, and worker updates.
 type PipelineTask struct {
-	ID             string   `json:"id"`
-	Summary        string   `json:"summary,omitempty"`
-	DelegationContext string `json:"delegation_context,omitempty"`
-	Channel        string   `json:"channel"`
-	ChatID         string   `json:"chat_id"`
-	SenderID       string   `json:"sender_id"`
-	Request        string   `json:"request"`
-	ExecutionMode  string   `json:"execution_mode,omitempty"`
-	WaitForTaskID  []string `json:"wait_for_task_id,omitempty"`
-	DispatchQueued bool     `json:"dispatch_queued,omitempty"`
-	PlannerAgent   string   `json:"planner_agent"`
-	Status         string   `json:"status"`
-	CreatedAtUTC   int64    `json:"created_at_utc"`
-	UpdatedAtUTC   int64    `json:"updated_at_utc"`
-	CheckpointAtUTC int64   `json:"checkpoint_at_utc,omitempty"`
-	CheckpointNote string   `json:"checkpoint_note,omitempty"`
-	StartedAtUTC   int64    `json:"started_at_utc,omitempty"`
-	FinishedAtUTC  int64    `json:"finished_at_utc,omitempty"`
-	PlannerResult  string   `json:"planner_result,omitempty"`
-	Error          string   `json:"error,omitempty"`
-	WorkerEvents   []string `json:"worker_events,omitempty"`
+	ID                     string   `json:"id"`
+	Summary                string   `json:"summary,omitempty"`
+	DelegationContext      string   `json:"delegation_context,omitempty"`
+	ConversationAgentID    string   `json:"conversation_agent_id,omitempty"`
+	ConversationSessionKey string   `json:"conversation_session_key,omitempty"`
+	Channel                string   `json:"channel"`
+	ChatID                 string   `json:"chat_id"`
+	SenderID               string   `json:"sender_id"`
+	Request                string   `json:"request"`
+	ExecutionMode          string   `json:"execution_mode,omitempty"`
+	WaitForTaskID          []string `json:"wait_for_task_id,omitempty"`
+	DispatchQueued         bool     `json:"dispatch_queued,omitempty"`
+	PlannerAgent           string   `json:"planner_agent"`
+	Status                 string   `json:"status"`
+	CreatedAtUTC           int64    `json:"created_at_utc"`
+	UpdatedAtUTC           int64    `json:"updated_at_utc"`
+	CheckpointAtUTC        int64    `json:"checkpoint_at_utc,omitempty"`
+	CheckpointNote         string   `json:"checkpoint_note,omitempty"`
+	StartedAtUTC           int64    `json:"started_at_utc,omitempty"`
+	FinishedAtUTC          int64    `json:"finished_at_utc,omitempty"`
+	PlannerResult          string   `json:"planner_result,omitempty"`
+	Error                  string   `json:"error,omitempty"`
+	WorkerEvents           []string `json:"worker_events,omitempty"`
 }
 
 // taskPipelineSnapshot is the on-disk format of TaskPipeline.
@@ -77,13 +79,13 @@ type taskPipelineSnapshot struct {
 // It persists tasks to disk, supports queueing, status queries, timeout checks,
 // and orphan detection after process restarts.
 type TaskPipeline struct {
-	mu          sync.RWMutex
-	tasks       map[string]*PipelineTask
+	mu           sync.RWMutex
+	tasks        map[string]*PipelineTask
 	nextSequence int
 	lastSeqDate  string
-	queue       chan string
-	storagePath string
-	timeout     time.Duration
+	queue        chan string
+	storagePath  string
+	timeout      time.Duration
 }
 
 // NewTaskPipeline creates a persistent task pipeline for the provided workspace.
@@ -98,11 +100,11 @@ func NewTaskPipeline(workspace string, timeout time.Duration) *TaskPipeline {
 	_ = os.MkdirAll(stateDir, 0o755)
 
 	tp := &TaskPipeline{
-		tasks:       map[string]*PipelineTask{},
+		tasks:        map[string]*PipelineTask{},
 		nextSequence: 1,
-		queue:       make(chan string, 256),
-		storagePath: filepath.Join(stateDir, taskPipelineFileName),
-		timeout:     timeout,
+		queue:        make(chan string, 256),
+		storagePath:  filepath.Join(stateDir, taskPipelineFileName),
+		timeout:      timeout,
 	}
 	tp.load()
 	return tp
@@ -159,18 +161,18 @@ func (tp *TaskPipeline) EnqueueTaskWithScheduling(
 		taskID = buildTaskID(time.UnixMilli(nowUTC).UTC(), sequence)
 	}
 	task := &PipelineTask{
-		ID:             taskID,
-		Summary:        normalizedSummary,
-		Channel:        channel,
-		ChatID:         chatID,
-		SenderID:       senderID,
-		Request:        request,
-		ExecutionMode:  normalizedMode,
-		WaitForTaskID:  uniqWaitForIDs,
-		DispatchQueued: dispatchNow,
-		Status:         TaskStatusQueued,
-		CreatedAtUTC:   nowUTC,
-		UpdatedAtUTC:   nowUTC,
+		ID:              taskID,
+		Summary:         normalizedSummary,
+		Channel:         channel,
+		ChatID:          chatID,
+		SenderID:        senderID,
+		Request:         request,
+		ExecutionMode:   normalizedMode,
+		WaitForTaskID:   uniqWaitForIDs,
+		DispatchQueued:  dispatchNow,
+		Status:          TaskStatusQueued,
+		CreatedAtUTC:    nowUTC,
+		UpdatedAtUTC:    nowUTC,
 		CheckpointAtUTC: nowUTC,
 	}
 	tp.tasks[taskID] = task
@@ -273,6 +275,31 @@ func (tp *TaskPipeline) SetDelegationContext(taskID, context string) bool {
 	if err := tp.saveLocked(); err != nil {
 		logger.WarnCF("agent", "Failed to persist delegation context", map[string]any{"task_id": taskID, "error": err.Error()})
 	}
+	return true
+}
+
+// BindConversationContext stores the routed agent/session pair for delegated task continuity.
+// The taskID parameter identifies the task, and agentID/sessionKey define where conversation history should be written.
+// It returns true when the task is found and updated.
+func (tp *TaskPipeline) BindConversationContext(taskID, agentID, sessionKey string) bool {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+
+	task, ok := tp.tasks[taskID]
+	if !ok {
+		return false
+	}
+
+	nowUTC := time.Now().UTC().UnixMilli()
+	task.ConversationAgentID = strings.TrimSpace(agentID)
+	task.ConversationSessionKey = strings.TrimSpace(sessionKey)
+	task.UpdatedAtUTC = nowUTC
+	task.CheckpointAtUTC = nowUTC
+	task.CheckpointNote = "conversation context bound"
+	if err := tp.saveLocked(); err != nil {
+		logger.WarnCF("agent", "Failed to persist task conversation context", map[string]any{"task_id": taskID, "error": err.Error()})
+	}
+
 	return true
 }
 
@@ -939,10 +966,10 @@ func (tp *TaskPipeline) load() {
 	}
 
 	logger.DebugCF("agent", "Loaded task pipeline state", map[string]any{
-		"tasks":             len(tp.tasks),
-		"next_sequence":     tp.nextSequence,
+		"tasks":              len(tp.tasks),
+		"next_sequence":      tp.nextSequence,
 		"last_sequence_date": tp.lastSeqDate,
-		"storage_path":      tp.storagePath,
+		"storage_path":       tp.storagePath,
 	})
 }
 

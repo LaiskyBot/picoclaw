@@ -116,6 +116,60 @@ func TestAgentLoop_ProcessMessage_DelegatesExternalTasks(t *testing.T) {
 	require.Regexp(t, regexp.MustCompile(`task-\d{4}-\d{2}-\d{2}-\d{4}\([^)]+\)`), statusResponse)
 }
 
+// TestAgentLoop_ProcessMessage_DelegatedTaskBridgesConversationSession verifies delegated tasks preserve routed conversation continuity.
+// It enqueues an external task, checks conversation context binding, and confirms final report is persisted into routed session history.
+// It returns no value and fails test on mismatches.
+func TestAgentLoop_ProcessMessage_DelegatedTaskBridgesConversationSession(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-loop-bridge-session-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), &simpleMockProvider{response: "unused"})
+
+	response, err := al.processMessage(context.Background(), bus.InboundMessage{
+		Channel:  "telegram",
+		ChatID:   "chat-55",
+		SenderID: "u55",
+		Content:  "Please remember that I prefer concise answers.",
+	})
+	require.NoError(t, err)
+
+	taskID := regexp.MustCompile(`task-\d{4}-\d{2}-\d{2}-\d{4}`).FindString(response)
+	require.NotEmpty(t, taskID)
+
+	task, ok := al.taskPipeline.GetTaskByID(taskID)
+	require.True(t, ok)
+	require.Equal(t, "main", task.ConversationAgentID)
+	require.NotEmpty(t, task.ConversationSessionKey)
+	require.Contains(t, task.DelegationContext, "prefer concise answers")
+
+	defaultAgent := al.registry.GetDefaultAgent()
+	require.NotNil(t, defaultAgent)
+	history := defaultAgent.Sessions.GetHistory(task.ConversationSessionKey)
+	require.NotEmpty(t, history)
+	require.Equal(t, "user", history[len(history)-1].Role)
+	require.Contains(t, history[len(history)-1].Content, "prefer concise answers")
+
+	require.True(t, al.taskPipeline.MarkPlannerCompleted(task.ID, "done"))
+	al.publishTaskFinalReport(task.ID, "done", nil)
+
+	updatedHistory := defaultAgent.Sessions.GetHistory(task.ConversationSessionKey)
+	require.Greater(t, len(updatedHistory), len(history))
+	require.Equal(t, "assistant", updatedHistory[len(updatedHistory)-1].Role)
+	require.Contains(t, updatedHistory[len(updatedHistory)-1].Content, "Task ")
+}
+
 // TestMatchStatusQuery_UrlStatusPathDoesNotTrigger verifies URLs containing /status/ do not trigger task status intent.
 // The t parameter controls test lifecycle and assertions.
 // It returns no value and fails when URL-only status tokens are misclassified.
@@ -460,5 +514,6 @@ func TestBuildPlannerDelegationPrompt_IncludesDelegationContext(t *testing.T) {
 	require.Contains(t, prompt, "deliver them via the message tool using attachments")
 	require.Contains(t, prompt, "Never claim media was sent unless the message tool call already succeeded")
 	require.Contains(t, prompt, "Do not output placeholders such as [Sending image]")
+	require.Contains(t, prompt, promptLengthControlHint)
 	require.Contains(t, prompt, "User request:")
 }

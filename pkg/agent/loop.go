@@ -43,6 +43,8 @@ type AgentLoop struct {
 	channelManager  *channels.Manager
 }
 
+const promptLengthControlHint = "Length control: keep output concise, prefer summaries over raw long logs/HTML, and avoid unnecessary long excerpts."
+
 // processOptions configures how a message is processed
 type processOptions struct {
 	SessionKey      string // Session identifier for history/context
@@ -386,11 +388,11 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 
 		if matched, signal := MatchStatusQuery(msg.Content); matched {
 			logger.DebugCF("agent", "Detected task status query", map[string]any{
-				"channel":       msg.Channel,
-				"chat_id":       msg.ChatID,
-				"sender_id":     msg.SenderID,
+				"channel":        msg.Channel,
+				"chat_id":        msg.ChatID,
+				"sender_id":      msg.SenderID,
 				"matched_signal": signal,
-				"content_chars": len(msg.Content),
+				"content_chars":  len(msg.Content),
 			})
 			return al.taskPipeline.BuildStatusReply(msg.Channel, msg.ChatID, msg.SenderID), nil
 		}
@@ -429,13 +431,42 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			GuildID:    msg.Metadata["guild_id"],
 			TeamID:     msg.Metadata["team_id"],
 		})
+		if !al.taskPipeline.BindConversationContext(task.ID, route.AgentID, route.SessionKey) {
+			logger.DebugCF("agent", "Failed to bind delegated task conversation context",
+				map[string]any{
+					"task_id":     task.ID,
+					"agent_id":    route.AgentID,
+					"session_key": route.SessionKey,
+				})
+		}
+
 		if routeAgent, ok := al.registry.GetAgent(route.AgentID); ok {
+			routeAgent.Sessions.AddMessage(route.SessionKey, "user", msg.Content)
+			if err := routeAgent.Sessions.Save(route.SessionKey); err != nil {
+				logger.DebugCF("agent", "Failed to save delegated user message in routed session",
+					map[string]any{
+						"task_id":     task.ID,
+						"agent_id":    route.AgentID,
+						"session_key": route.SessionKey,
+						"error":       err.Error(),
+					})
+			}
+
 			history := routeAgent.Sessions.GetHistory(route.SessionKey)
 			conversationSummary := routeAgent.Sessions.GetSummary(route.SessionKey)
 			delegationContext := buildDelegationReference(routeAgent, history, conversationSummary)
 			if delegationContext != "" {
 				_ = al.taskPipeline.SetDelegationContext(task.ID, delegationContext)
 			}
+			logger.DebugCF("agent", "Delegated task context prepared",
+				map[string]any{
+					"task_id":                  task.ID,
+					"agent_id":                 route.AgentID,
+					"session_key":              route.SessionKey,
+					"history_count":            len(history),
+					"has_summary":              strings.TrimSpace(conversationSummary) != "",
+					"delegation_context_chars": len(delegationContext),
+				})
 		}
 
 		return fmt.Sprintf(
@@ -749,17 +780,14 @@ func (al *AgentLoop) runLLMIteration(
 				break
 			}
 
-			errMsg := strings.ToLower(err.Error())
-			isContextError := strings.Contains(errMsg, "token") ||
-				strings.Contains(errMsg, "context") ||
-				strings.Contains(errMsg, "invalidparameter") ||
-				strings.Contains(errMsg, "length")
+			isContextError := isContextWindowError(err)
 
 			if isContextError && retry < maxRetries {
 				logger.WarnCF("agent", "Context window error detected, attempting compression", map[string]any{
 					"error": err.Error(),
 					"retry": retry,
 				})
+				al.logContextSizeDiagnostics(messages, opts.SessionKey, retry)
 
 				if retry == 0 && !constants.IsInternalChannel(opts.Channel) {
 					al.bus.PublishOutbound(bus.OutboundMessage{
@@ -769,13 +797,22 @@ func (al *AgentLoop) runLLMIteration(
 					})
 				}
 
-				al.forceCompression(agent, opts.SessionKey)
+				compressed := al.emergencyCompressHistoryWithLLM(ctx, agent, opts.SessionKey, retry)
+				if !compressed {
+					al.forceCompression(agent, opts.SessionKey)
+				}
 				newHistory := agent.Sessions.GetHistory(opts.SessionKey)
 				newSummary := agent.Sessions.GetSummary(opts.SessionKey)
 				messages = agent.ContextBuilder.BuildMessages(
 					newHistory, newSummary, "",
 					nil, opts.Channel, opts.ChatID,
 				)
+				logger.DebugCF("agent", "Rebuilt messages after context compression", map[string]any{
+					"session_key":       opts.SessionKey,
+					"retry":             retry,
+					"compressed_by_llm": compressed,
+					"messages_count":    len(messages),
+				})
 				continue
 			}
 			break
@@ -923,6 +960,20 @@ func (al *AgentLoop) runLLMIteration(
 	}
 
 	return finalContent, iteration, nil
+}
+
+// isContextWindowError checks whether an error indicates model context/token length overflow.
+// The err parameter is any upstream provider error and may include transport wrappers.
+// It returns true when the error text strongly suggests context length exhaustion.
+func isContextWindowError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errMsg := strings.ToLower(err.Error())
+	return strings.Contains(errMsg, "token") ||
+		strings.Contains(errMsg, "context") ||
+		strings.Contains(errMsg, "invalidparameter") ||
+		strings.Contains(errMsg, "length")
 }
 
 // updateToolContexts updates context for tools that need channel/chatID and task references.
@@ -1098,6 +1149,255 @@ func (al *AgentLoop) forceCompression(agent *AgentInstance, sessionKey string) {
 	})
 }
 
+// logContextSizeDiagnostics records size-only context metrics for overflow troubleshooting.
+// The messages parameter is the pending prompt payload and sessionKey identifies the chat session.
+// It returns no value and intentionally avoids logging message content.
+func (al *AgentLoop) logContextSizeDiagnostics(messages []providers.Message, sessionKey string, retry int) {
+	type messageSize struct {
+		index   int
+		role    string
+		content int
+	}
+
+	totalChars := 0
+	top := make([]messageSize, 0, 3)
+	for idx, msg := range messages {
+		msgLen := utf8.RuneCountInString(msg.Content)
+		totalChars += msgLen
+		candidate := messageSize{index: idx, role: msg.Role, content: msgLen}
+		top = append(top, candidate)
+		sort.Slice(top, func(i, j int) bool {
+			return top[i].content > top[j].content
+		})
+		if len(top) > 3 {
+			top = top[:3]
+		}
+	}
+
+	largest := make([]map[string]any, 0, len(top))
+	for _, item := range top {
+		largest = append(largest, map[string]any{
+			"index":         item.index,
+			"role":          item.role,
+			"content_chars": item.content,
+		})
+	}
+
+	logger.DebugCF("agent", "Context size diagnostics", map[string]any{
+		"session_key":      sessionKey,
+		"retry":            retry,
+		"messages_count":   len(messages),
+		"total_chars":      totalChars,
+		"largest_messages": largest,
+	})
+}
+
+// emergencyCompressHistoryWithLLM compacts session history via a bounded summarization request.
+// The ctx parameter controls the provider call lifecycle, and retry indicates current retry index.
+// It returns true when summary/history are updated and false when fallback compression is required.
+func (al *AgentLoop) emergencyCompressHistoryWithLLM(
+	ctx context.Context,
+	agent *AgentInstance,
+	sessionKey string,
+	retry int,
+) bool {
+	history := agent.Sessions.GetHistory(sessionKey)
+	if len(history) == 0 {
+		return false
+	}
+
+	compressionSource, sourceMessages, sourceChars, omittedMessages := buildEmergencyCompressionSource(history)
+	if compressionSource == "" {
+		return false
+	}
+
+	existingSummary := strings.TrimSpace(agent.Sessions.GetSummary(sessionKey))
+	var prompt strings.Builder
+	prompt.WriteString("EMERGENCY_CONTEXT_COMPRESSION\n")
+	prompt.WriteString("The previous request exceeded the provider context window. Compress memory aggressively.\n")
+	prompt.WriteString("Return plain text only, maximum 1200 characters.\n")
+	prompt.WriteString(promptLengthControlHint)
+	prompt.WriteString("\n")
+	prompt.WriteString("Keep only: user goals, constraints, important facts, completed actions, pending actions.\n")
+	prompt.WriteString("Drop verbose logs, HTML, duplicated details, and low-value tool output.\n")
+	if existingSummary != "" {
+		prompt.WriteString("\nExisting summary:\n")
+		prompt.WriteString(existingSummary)
+		prompt.WriteString("\n")
+	}
+	prompt.WriteString("\nConversation snippets:\n")
+	prompt.WriteString(compressionSource)
+
+	compressCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	response, err := agent.Provider.Chat(
+		compressCtx,
+		[]providers.Message{
+			{Role: "system", Content: "You compress overflowing chat context into a compact memory note."},
+			{Role: "user", Content: prompt.String()},
+		},
+		nil,
+		agent.Model,
+		map[string]any{
+			"max_tokens":       640,
+			"temperature":      0.2,
+			"prompt_cache_key": agent.ID,
+		},
+	)
+	if err != nil || response == nil {
+		logger.DebugCF("agent", "Emergency LLM compression failed", map[string]any{
+			"session_key":      sessionKey,
+			"retry":            retry,
+			"source_messages":  sourceMessages,
+			"source_chars":     sourceChars,
+			"omitted_messages": omittedMessages,
+			"error":            safeErrString(err),
+		})
+		return false
+	}
+
+	compressedSummary := strings.TrimSpace(response.Content)
+	if compressedSummary == "" {
+		return false
+	}
+
+	agent.Sessions.SetSummary(sessionKey, compressedSummary)
+	trimmedHistory := trimHistoryForEmergencyRetry(history, 2, 1200)
+	agent.Sessions.SetHistory(sessionKey, trimmedHistory)
+	agent.Sessions.Save(sessionKey)
+
+	logger.WarnCF("agent", "Emergency LLM compression executed", map[string]any{
+		"session_key":         sessionKey,
+		"retry":               retry,
+		"source_messages":     sourceMessages,
+		"source_chars":        sourceChars,
+		"omitted_messages":    omittedMessages,
+		"summary_chars":       utf8.RuneCountInString(compressedSummary),
+		"trimmed_history_len": len(trimmedHistory),
+	})
+
+	return true
+}
+
+// safeErrString formats optional errors for structured logs.
+// The err parameter may be nil.
+// It returns an empty string when err is nil, otherwise the error text.
+func safeErrString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// buildEmergencyCompressionSource converts history into bounded snippets for LLM compression.
+// The history parameter is full session history and may contain very large tool outputs.
+// It returns snippet text, included message count, included rune count, and omitted message count.
+func buildEmergencyCompressionSource(history []providers.Message) (string, int, int, int) {
+	if len(history) == 0 {
+		return "", 0, 0, 0
+	}
+
+	maxMessages := 18
+	maxPerMessageChars := 1200
+	maxTotalChars := 12000
+
+	start := 0
+	if len(history) > maxMessages {
+		start = len(history) - maxMessages
+	}
+
+	var sb strings.Builder
+	includedMessages := 0
+	includedChars := 0
+	omittedMessages := 0
+
+	for idx, msg := range history[start:] {
+		if msg.Role == "system" {
+			continue
+		}
+		content := strings.TrimSpace(msg.Content)
+		if content == "" {
+			continue
+		}
+		trimmed, truncated := truncateRunesWithNote(content, maxPerMessageChars)
+		entryChars := utf8.RuneCountInString(trimmed)
+		if includedChars+entryChars > maxTotalChars {
+			omittedMessages++
+			continue
+		}
+		fmt.Fprintf(&sb, "[%d] %s: %s\n", start+idx, msg.Role, trimmed)
+		includedMessages++
+		includedChars += entryChars
+		if truncated {
+			omittedMessages++
+		}
+	}
+
+	if includedMessages == 0 {
+		return "", 0, 0, omittedMessages
+	}
+	return sb.String(), includedMessages, includedChars, omittedMessages
+}
+
+// truncateRunesWithNote trims text by rune count and appends a truncation note when needed.
+// The text parameter may contain multi-byte characters and maxRunes defines hard rune cap.
+// It returns the possibly trimmed text and whether truncation occurred.
+func truncateRunesWithNote(text string, maxRunes int) (string, bool) {
+	if maxRunes <= 0 {
+		return "", text != ""
+	}
+	if utf8.RuneCountInString(text) <= maxRunes {
+		return text, false
+	}
+	runes := []rune(text)
+	trimmed := strings.TrimSpace(string(runes[:maxRunes]))
+	if trimmed == "" {
+		return "[truncated]", true
+	}
+	return trimmed + " ... [truncated]", true
+}
+
+// trimHistoryForEmergencyRetry keeps a short tail of history and clips oversized message content.
+// The history parameter is the original session history and keepLast controls tail size.
+// It returns a sanitized tail suitable for immediate retry after overflow errors.
+func trimHistoryForEmergencyRetry(history []providers.Message, keepLast, maxContentChars int) []providers.Message {
+	if keepLast <= 0 {
+		return []providers.Message{}
+	}
+	if len(history) == 0 {
+		return []providers.Message{}
+	}
+
+	start := len(history) - keepLast
+	if start < 0 {
+		start = 0
+	}
+
+	trimmed := make([]providers.Message, 0, keepLast)
+	for _, msg := range history[start:] {
+		if msg.Role == "system" {
+			continue
+		}
+		copied := msg
+		copied.Content, _ = truncateRunesWithNote(copied.Content, maxContentChars)
+		trimmed = append(trimmed, copied)
+	}
+
+	if len(trimmed) == 0 {
+		for i := len(history) - 1; i >= 0; i-- {
+			if history[i].Role == "system" {
+				continue
+			}
+			copied := history[i]
+			copied.Content, _ = truncateRunesWithNote(copied.Content, maxContentChars)
+			return []providers.Message{copied}
+		}
+	}
+
+	return trimmed
+}
+
 // GetStartupInfo returns information about loaded tools and skills for logging.
 func (al *AgentLoop) GetStartupInfo() map[string]any {
 	info := make(map[string]any)
@@ -1224,7 +1524,8 @@ func (al *AgentLoop) summarizeSession(agent *AgentInstance, sessionKey string) {
 		s2, _ := al.summarizeBatch(ctx, agent, part2, "")
 
 		mergePrompt := fmt.Sprintf(
-			"Merge these two conversation summaries into one cohesive summary:\n\n1: %s\n\n2: %s",
+			"Merge these two conversation summaries into one cohesive summary. Return plain text only and keep it short. %s\n\n1: %s\n\n2: %s",
+			promptLengthControlHint,
 			s1,
 			s2,
 		)
@@ -1268,6 +1569,8 @@ func (al *AgentLoop) summarizeBatch(
 ) (string, error) {
 	var sb strings.Builder
 	sb.WriteString("Provide a concise summary of this conversation segment, preserving core context and key points.\n")
+	sb.WriteString(promptLengthControlHint)
+	sb.WriteString("\n")
 	if existingSummary != "" {
 		sb.WriteString("Existing context: ")
 		sb.WriteString(existingSummary)

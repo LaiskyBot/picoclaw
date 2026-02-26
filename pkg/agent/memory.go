@@ -7,11 +7,14 @@
 package agent
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/sipeed/picoclaw/pkg/logger"
 )
 
 // MemoryStore manages persistent memory for the agent.
@@ -30,7 +33,31 @@ func NewMemoryStore(workspace string) *MemoryStore {
 	memoryFile := filepath.Join(memoryDir, "MEMORY.md")
 
 	// Ensure memory directory exists
-	os.MkdirAll(memoryDir, 0o755)
+	if err := os.MkdirAll(memoryDir, 0o755); err != nil {
+		logger.DebugCF("agent", "Failed to create memory directory", map[string]any{
+			"workspace": workspace,
+			"error":     err.Error(),
+		})
+	} else {
+		if _, err := os.Stat(memoryFile); errors.Is(err, os.ErrNotExist) {
+			const initialContent = "# Memory\n\n"
+			if writeErr := os.WriteFile(memoryFile, []byte(initialContent), 0o644); writeErr != nil {
+				logger.DebugCF("agent", "Failed to bootstrap memory file", map[string]any{
+					"memory_file": memoryFile,
+					"error":       writeErr.Error(),
+				})
+			} else {
+				logger.DebugCF("agent", "Bootstrapped memory file", map[string]any{
+					"memory_file": memoryFile,
+				})
+			}
+		} else if err != nil {
+			logger.DebugCF("agent", "Failed to stat memory file", map[string]any{
+				"memory_file": memoryFile,
+				"error":       err.Error(),
+			})
+		}
+	}
 
 	return &MemoryStore{
 		workspace:  workspace,
