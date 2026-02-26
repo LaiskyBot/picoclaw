@@ -186,10 +186,21 @@ func TestFormatTaskFinalReport_UserFacingMessage(t *testing.T) {
 	require.Equal(t, "Task completed.", fallback)
 
 	failed := formatTaskFinalReport(task, TaskStatusFailed, "planner crashed")
-	require.Equal(t, "planner crashed", failed)
+	require.Equal(t, "❌ Task failed.\nError: planner crashed", failed)
 
 	wrapped := formatTaskFinalReport(task, TaskStatusDone, "Task task-2026-02-26-0049(demo) finished (completed).\nSummary: Task completed.\nDuration: 2s")
 	require.Equal(t, "Task completed.", wrapped)
+}
+
+// TestIsPlannerSummaryEmpty verifies planner empty-summary sentinel is consistently detected.
+// The t parameter controls assertions for empty, sentinel, and normal textual outputs.
+// It returns no value and fails when empty planner result classification regresses.
+func TestIsPlannerSummaryEmpty(t *testing.T) {
+	require.True(t, isPlannerSummaryEmpty(""))
+	require.True(t, isPlannerSummaryEmpty("   "))
+	require.True(t, isPlannerSummaryEmpty(plannerEmptySummaryText))
+	require.True(t, isPlannerSummaryEmpty("  "+plannerEmptySummaryText+"  "))
+	require.False(t, isPlannerSummaryEmpty("Task completed."))
 }
 
 // TestFormatTaskFinalLogReport_OperationalDetails verifies debug formatter keeps lifecycle metadata for logs.
@@ -253,6 +264,64 @@ func TestBuildUserTaskFinalReport_FallsBackWhenRewriteEmpty(t *testing.T) {
 
 	report := al.buildUserTaskFinalReport(task, TaskStatusDone, "Task completed.")
 	require.Equal(t, "Task completed.", report)
+}
+
+// TestBuildUserTaskFinalReport_FailedTaskBypassesRewrite verifies failed-task report keeps prominent deterministic error text.
+// The t parameter controls assertions ensuring failed reports are not rewritten by model output.
+// It returns no value and fails when failure visibility is downgraded.
+func TestBuildUserTaskFinalReport_FailedTaskBypassesRewrite(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), &simpleMockProvider{response: "rewritten"})
+	task := &PipelineTask{Request: "summarize the result"}
+
+	report := al.buildUserTaskFinalReport(task, TaskStatusFailed, "planner finished without textual summary")
+	require.Equal(t, "❌ Task failed.\nError: planner finished without textual summary", report)
+}
+
+// TestPublishTaskFinalReport_FailureSendsProminentError verifies failed delegated tasks notify users with explicit error details.
+// The t parameter controls setup and outbound message assertions for failure reporting.
+// It returns no value and fails when final failure reports become ambiguous.
+func TestPublishTaskFinalReport_FailureSendsProminentError(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	al := NewAgentLoop(cfg, msgBus, &simpleMockProvider{response: "unused"})
+
+	task, err := al.taskPipeline.EnqueueTask("telegram", "chat-err", "user-err", "do something", "do something")
+	require.NoError(t, err)
+	require.True(t, al.taskPipeline.MarkFailed(task.ID, "planner finished without textual summary"))
+
+	al.publishTaskFinalReport(task.ID, "", fmt.Errorf("planner finished without textual summary"))
+
+	readCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	outbound, ok := msgBus.SubscribeOutbound(readCtx)
+	require.True(t, ok)
+	require.Equal(t, "telegram", outbound.Channel)
+	require.Equal(t, "chat-err", outbound.ChatID)
+	require.Contains(t, outbound.Content, "❌ Task failed.")
+	require.Contains(t, outbound.Content, "Error: planner finished without textual summary")
 }
 
 // TestMatchStatusQuery_UrlStatusPathDoesNotTrigger verifies URLs containing /status/ do not trigger task status intent.

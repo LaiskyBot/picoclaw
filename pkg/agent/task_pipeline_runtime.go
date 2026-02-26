@@ -110,8 +110,14 @@ func (al *AgentLoop) executePlannerTask(parentCtx context.Context, task *Pipelin
 
 	runner := al.getPlannerAgent()
 	if runner == nil {
-		al.taskPipeline.MarkFailed(task.ID, "assistant agent is not configured")
-		al.publishTaskFinalReport(task.ID, "", fmt.Errorf("assistant agent is not configured"))
+		err := fmt.Errorf("planner agent is not configured")
+		logger.ErrorCF("agent", "Planner task cannot start: default/planner agent missing", map[string]any{
+			"task_id": task.ID,
+			"channel": task.Channel,
+			"chat_id": task.ChatID,
+		})
+		al.taskPipeline.MarkFailed(task.ID, err.Error())
+		al.publishTaskFinalReport(task.ID, "", err)
 		return
 	}
 
@@ -154,9 +160,30 @@ func (al *AgentLoop) executePlannerTask(parentCtx context.Context, task *Pipelin
 		NoHistory:       true,
 	})
 	if err != nil {
+		logger.ErrorCF("agent", "Planner run failed", map[string]any{
+			"task_id":     task.ID,
+			"agent_id":    runner.ID,
+			"session_key": sessionKey,
+			"error":       err.Error(),
+		})
 		al.taskPipeline.MarkFailed(task.ID, err.Error())
 		al.taskPipeline.CheckpointTask(task.ID, "planner run failed")
 		al.publishTaskFinalReport(task.ID, "", err)
+		return
+	}
+
+	if isPlannerSummaryEmpty(result) {
+		emptySummaryErr := fmt.Errorf("planner finished without textual summary")
+		logger.WarnCF("agent", "Planner task finished with empty textual output", map[string]any{
+			"task_id":        task.ID,
+			"agent_id":       runner.ID,
+			"session_key":    sessionKey,
+			"result_preview": utils.Truncate(strings.TrimSpace(result), 120),
+			"max_iterations": runner.MaxIterations,
+		})
+		al.taskPipeline.MarkFailed(task.ID, emptySummaryErr.Error())
+		al.taskPipeline.CheckpointTask(task.ID, "planner run failed: empty textual output")
+		al.publishTaskFinalReport(task.ID, "", emptySummaryErr)
 		return
 	}
 
@@ -186,6 +213,14 @@ func (al *AgentLoop) publishTaskFinalReport(taskID, plannerSummary string, runEr
 		summary = "No textual summary was produced."
 	}
 
+	logger.DebugCF("agent", "Preparing delegated task final report", map[string]any{
+		"task_id":            task.ID,
+		"status":             task.Status,
+		"planner_summary_len": len(strings.TrimSpace(plannerSummary)),
+		"stored_summary_len":  len(strings.TrimSpace(task.PlannerResult)),
+		"run_error":          runErr != nil,
+	})
+
 	finalStatus := task.Status
 	if runErr != nil {
 		finalStatus = TaskStatusFailed
@@ -198,6 +233,13 @@ func (al *AgentLoop) publishTaskFinalReport(taskID, plannerSummary string, runEr
 
 	report := al.buildUserTaskFinalReport(task, finalStatus, summary)
 	logReport := formatTaskFinalLogReport(task, finalStatus, summary)
+	logger.DebugCF("agent", "Publishing delegated task final report to channel", map[string]any{
+		"task_id":      task.ID,
+		"channel":      task.Channel,
+		"chat_id":      task.ChatID,
+		"final_status": finalStatus,
+		"report_chars": len(report),
+	})
 	al.bus.PublishOutbound(bus.OutboundMessage{
 		Channel: task.Channel,
 		ChatID:  task.ChatID,
@@ -219,6 +261,9 @@ func (al *AgentLoop) publishTaskFinalReport(taskID, plannerSummary string, runEr
 // It returns an LLM-refined user reply when possible, or deterministic fallback text when rewrite fails.
 func (al *AgentLoop) buildUserTaskFinalReport(task *PipelineTask, finalStatus, summary string) string {
 	fallback := formatTaskFinalReport(task, finalStatus, summary)
+	if finalStatus == TaskStatusFailed {
+		return fallback
+	}
 	if !shouldRewriteTaskSummary(summary) {
 		return fallback
 	}
@@ -253,6 +298,14 @@ func (al *AgentLoop) buildUserTaskFinalReport(task *PipelineTask, finalStatus, s
 	}
 
 	return utils.Truncate(rewritten, 2800)
+}
+
+// isPlannerSummaryEmpty reports whether planner output has no user-meaningful text.
+// The summary parameter is raw planner final content from runAgentLoop.
+// It returns true when output is empty or equals the internal empty-summary sentinel.
+func isPlannerSummaryEmpty(summary string) bool {
+	trimmed := strings.TrimSpace(summary)
+	return trimmed == "" || trimmed == plannerEmptySummaryText
 }
 
 // shouldRewriteTaskSummary reports whether raw task output needs LLM rewrite before user delivery.
@@ -333,16 +386,20 @@ func (al *AgentLoop) recordDelegatedTaskResult(task *PipelineTask, report string
 func formatTaskFinalReport(task *PipelineTask, finalStatus, summary string) string {
 	if task == nil {
 		if finalStatus == TaskStatusFailed {
-			return "Task failed."
+			return "❌ Task failed.\nError: unknown error."
 		}
 		return "Task completed."
 	}
 
 	textSummary := normalizeTaskUserSummary(summary)
-	if textSummary == "" {
-		if finalStatus == TaskStatusFailed {
-			return "Task failed."
+	if finalStatus == TaskStatusFailed {
+		if textSummary == "" {
+			textSummary = "unknown error"
 		}
+		return utils.Truncate(fmt.Sprintf("❌ Task failed.\nError: %s", textSummary), 2800)
+	}
+
+	if textSummary == "" {
 		return "Task completed."
 	}
 

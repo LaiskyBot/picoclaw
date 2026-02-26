@@ -46,6 +46,8 @@ type AgentLoop struct {
 
 const promptLengthControlHint = "Length control: keep output concise, prefer summaries over raw long logs/HTML, and avoid unnecessary long excerpts."
 
+const nonEmptyDefaultResponse = "I've completed processing but have no response to give."
+
 // processOptions configures how a message is processed
 type processOptions struct {
 	SessionKey      string // Session identifier for history/context
@@ -692,8 +694,28 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	// This is controlled by the tool's Silent flag and ForUser content
 
 	// 6. Handle empty response
-	if finalContent == "" {
-		finalContent = opts.DefaultResponse
+	if strings.TrimSpace(finalContent) == "" {
+		defaultResponse := strings.TrimSpace(opts.DefaultResponse)
+		if defaultResponse == "" {
+			logger.WarnCF("agent", "DefaultResponse is empty; using non-empty fallback", map[string]any{
+				"agent_id":    agent.ID,
+				"session_key": opts.SessionKey,
+				"channel":     opts.Channel,
+				"chat_id":     opts.ChatID,
+			})
+			defaultResponse = nonEmptyDefaultResponse
+		}
+		finalContent = defaultResponse
+	}
+
+	if strings.TrimSpace(finalContent) == "" {
+		logger.ErrorCF("agent", "Final response unexpectedly empty after fallback; forcing non-empty response", map[string]any{
+			"agent_id":    agent.ID,
+			"session_key": opts.SessionKey,
+			"channel":     opts.Channel,
+			"chat_id":     opts.ChatID,
+		})
+		finalContent = nonEmptyDefaultResponse
 	}
 
 	// 7. Save final assistant message to session
@@ -770,6 +792,7 @@ func (al *AgentLoop) runLLMIteration(
 ) (string, int, error) {
 	iteration := 0
 	var finalContent string
+	sawToolCalls := false
 
 	for iteration < agent.MaxIterations {
 		iteration++
@@ -922,6 +945,7 @@ func (al *AgentLoop) runLLMIteration(
 				"count":     len(normalizedToolCalls),
 				"iteration": iteration,
 			})
+		sawToolCalls = true
 
 		// Build assistant message with tool calls
 		assistantMsg := providers.Message{
@@ -1042,6 +1066,16 @@ func (al *AgentLoop) runLLMIteration(
 			// Save tool result message to session
 			agent.Sessions.AddFullMessage(opts.SessionKey, toolResultMsg)
 		}
+	}
+
+	if finalContent == "" && iteration >= agent.MaxIterations && sawToolCalls {
+		logger.WarnCF("agent", "LLM loop reached max iterations without textual final response", map[string]any{
+			"agent_id":       agent.ID,
+			"session_key":    opts.SessionKey,
+			"channel":        opts.Channel,
+			"chat_id":        opts.ChatID,
+			"max_iterations": agent.MaxIterations,
+		})
 	}
 
 	return finalContent, iteration, nil

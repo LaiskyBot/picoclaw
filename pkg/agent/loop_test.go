@@ -170,6 +170,39 @@ func TestRunAgentLoop_UsesMCPMemoryLifecycle(t *testing.T) {
 	require.Equal(t, "session-1", capturedAfterArgs["session_id"])
 }
 
+// TestRunAgentLoop_EmptyDefaultResponseStillReturnsNonEmpty verifies global non-empty fallback when model and default output are blank.
+// The t parameter controls assertions for response fallback stability.
+// It returns no value and fails when an empty final response is returned.
+func TestRunAgentLoop_EmptyDefaultResponseStillReturnsNonEmpty(t *testing.T) {
+	tmpDir := t.TempDir()
+	provider := &simpleMockProvider{response: "   "}
+	agentInstance := &AgentInstance{
+		ID:             "main",
+		Model:          "test-model",
+		MaxIterations:  1,
+		MaxTokens:      1024,
+		Temperature:    0,
+		Provider:       provider,
+		Sessions:       session.NewSessionManager(filepath.Join(tmpDir, "sessions")),
+		ContextBuilder: NewContextBuilder(tmpDir),
+		Tools:          tools.NewToolRegistry(),
+	}
+
+	al := &AgentLoop{bus: bus.NewMessageBus()}
+	response, err := al.runAgentLoop(context.Background(), agentInstance, processOptions{
+		SessionKey:      "agent:main:test:empty-default",
+		Channel:         "telegram",
+		ChatID:          "861999008",
+		UserMessage:     "hello",
+		DefaultResponse: "   ",
+		EnableSummary:   false,
+		SendResponse:    false,
+		NoHistory:       true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, nonEmptyDefaultResponse, response)
+}
+
 // TestBuildDelegationReference_IncludesSummaryHistoryMemory verifies delegated reference payload contains key context blocks.
 // It seeds summary, recent messages, and long-term memory then validates formatted output.
 // It returns no value and fails test on missing sections.
