@@ -616,6 +616,49 @@ func TestRunAgentLoop_UsesToolContextOverrides(t *testing.T) {
 	require.Equal(t, "861999008", messageTool.lastChatID)
 }
 
+// TestRunAgentLoop_SanitizesSyntheticMediaMarkerWithoutMessageSend verifies fake media markers are not forwarded to users.
+// It runs a direct-answer loop where no message tool send occurs and asserts outbound text is sanitized.
+// It returns no value and fails when placeholder marker leaks to outbound channel.
+func TestRunAgentLoop_SanitizesSyntheticMediaMarkerWithoutMessageSend(t *testing.T) {
+	tmpDir := t.TempDir()
+	provider := &simpleMockProvider{response: "[Sending image]"}
+	msgBus := bus.NewMessageBus()
+
+	agentInstance := &AgentInstance{
+		ID:            "main",
+		Model:         "test-model",
+		MaxIterations: 1,
+		MaxTokens:     1024,
+		Temperature:   0,
+		Provider:      provider,
+		Sessions:      session.NewSessionManager(filepath.Join(tmpDir, "sessions")),
+		ContextBuilder: NewContextBuilder(tmpDir),
+		Tools:         tools.NewToolRegistry(),
+	}
+	agentInstance.Tools.Register(tools.NewMessageTool())
+
+	al := &AgentLoop{bus: msgBus}
+	_, err := al.runAgentLoop(context.Background(), agentInstance, processOptions{
+		SessionKey:      "agent:main:test:marker",
+		Channel:         "telegram",
+		ChatID:          "861999008",
+		UserMessage:     "take screenshot",
+		DefaultResponse: "empty",
+		EnableSummary:   false,
+		SendResponse:    true,
+		NoHistory:       true,
+	})
+	require.NoError(t, err)
+
+	readCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	outbound, ok := msgBus.SubscribeOutbound(readCtx)
+	require.True(t, ok)
+	require.Equal(t, "telegram", outbound.Channel)
+	require.NotContains(t, outbound.Content, "[Sending image]")
+	require.Contains(t, outbound.Content, "could not send an attachment")
+}
+
 // TestToolResult_SilentToolDoesNotSendUserMessage verifies silent tools don't trigger outbound
 func TestToolResult_SilentToolDoesNotSendUserMessage(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "agent-test-*")

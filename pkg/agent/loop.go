@@ -384,7 +384,14 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			return response, nil
 		}
 
-		if IsStatusQuery(msg.Content) {
+		if matched, signal := MatchStatusQuery(msg.Content); matched {
+			logger.DebugCF("agent", "Detected task status query", map[string]any{
+				"channel":       msg.Channel,
+				"chat_id":       msg.ChatID,
+				"sender_id":     msg.SenderID,
+				"matched_signal": signal,
+				"content_chars": len(msg.Content),
+			})
 			return al.taskPipeline.BuildStatusReply(msg.Channel, msg.ChatID, msg.SenderID), nil
 		}
 
@@ -595,6 +602,28 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	finalContent, iteration, err := al.runLLMIteration(ctx, agent, messages, opts)
 	if err != nil {
 		return "", err
+	}
+
+	messageSentInRound := hasMessageToolSentInRound(agent)
+	if hasSyntheticMediaMarker(finalContent) {
+		if messageSentInRound {
+			logger.DebugCF("agent", "Assistant response contains media marker after successful message tool send", map[string]any{
+				"agent_id":      agent.ID,
+				"session_key":   opts.SessionKey,
+				"channel":       opts.Channel,
+				"chat_id":       opts.ChatID,
+				"content_chars": len(finalContent),
+			})
+		} else {
+			logger.DebugCF("agent", "Assistant response contains synthetic media marker without actual attachment send", map[string]any{
+				"agent_id":      agent.ID,
+				"session_key":   opts.SessionKey,
+				"channel":       opts.Channel,
+				"chat_id":       opts.ChatID,
+				"content_chars": len(finalContent),
+			})
+			finalContent = sanitizeSyntheticMediaStatus(finalContent, false)
+		}
 	}
 
 	// If last tool had ForUser content and we already sent it, we might not need to send final response

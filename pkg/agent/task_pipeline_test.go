@@ -116,6 +116,65 @@ func TestAgentLoop_ProcessMessage_DelegatesExternalTasks(t *testing.T) {
 	require.Regexp(t, regexp.MustCompile(`task-\d{4}-\d{2}-\d{2}-\d{4}\([^)]+\)`), statusResponse)
 }
 
+// TestMatchStatusQuery_UrlStatusPathDoesNotTrigger verifies URLs containing /status/ do not trigger task status intent.
+// The t parameter controls test lifecycle and assertions.
+// It returns no value and fails when URL-only status tokens are misclassified.
+func TestMatchStatusQuery_UrlStatusPathDoesNotTrigger(t *testing.T) {
+	matched, signal := MatchStatusQuery("总结分析一下这篇文章 https://x.com/1914ad/status/2026757796390449382")
+	require.False(t, matched)
+	require.Empty(t, signal)
+}
+
+// TestMatchStatusQuery_RecognizesCommandsAndKeywords verifies explicit status commands and keywords are still recognized.
+// The t parameter controls test lifecycle and assertions.
+// It returns no value and fails when expected status queries are not matched.
+func TestMatchStatusQuery_RecognizesCommandsAndKeywords(t *testing.T) {
+	matched, signal := MatchStatusQuery("/status")
+	require.True(t, matched)
+	require.Equal(t, "/status", signal)
+
+	matched, signal = MatchStatusQuery("当前任务进度到哪了")
+	require.True(t, matched)
+	require.Equal(t, "进度", signal)
+
+	matched, signal = MatchStatusQuery("what is the current task status?")
+	require.True(t, matched)
+	require.Equal(t, "status", signal)
+}
+
+// TestAgentLoop_ProcessMessage_StatusURLRequestIsDelegated verifies status-like URL requests are delegated instead of misrouted.
+// The t parameter controls test lifecycle and assertions.
+// It returns no value and fails when processMessage incorrectly returns task status listing.
+func TestAgentLoop_ProcessMessage_StatusURLRequestIsDelegated(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-loop-status-url-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), &simpleMockProvider{response: "unused"})
+
+	response, err := al.processMessage(context.Background(), bus.InboundMessage{
+		Channel:  "telegram",
+		ChatID:   "chat-77",
+		SenderID: "u77",
+		Content:  "总结分析一下这篇文章 https://x.com/1914ad/status/2026757796390449382",
+	})
+	require.NoError(t, err)
+	require.Contains(t, response, "Task ")
+	require.Contains(t, response, "accepted")
+	require.NotContains(t, response, "Task status:")
+}
+
 // TestTaskPipeline_PromoteRunnableQueuedTasks verifies waiting tasks are promoted when dependencies finish.
 // It enqueues a running task and a dependent waiting task, then completes dependency and promotes queued task.
 // It returns no value and fails test on mismatches.
@@ -398,5 +457,8 @@ func TestBuildPlannerDelegationPrompt_IncludesDelegationContext(t *testing.T) {
 	require.Contains(t, prompt, "Task tracking id: task-2026-02-25-0001")
 	require.Contains(t, prompt, "Delegation reference (memory and interaction history):")
 	require.Contains(t, prompt, "root cause first")
+	require.Contains(t, prompt, "deliver them via the message tool using attachments")
+	require.Contains(t, prompt, "Never claim media was sent unless the message tool call already succeeded")
+	require.Contains(t, prompt, "Do not output placeholders such as [Sending image]")
 	require.Contains(t, prompt, "User request:")
 }
