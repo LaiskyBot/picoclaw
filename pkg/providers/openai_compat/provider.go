@@ -84,6 +84,11 @@ func (p *Provider) Chat(
 	if len(tools) > 0 {
 		requestBody["tools"] = toResponseTools(tools)
 		requestBody["tool_choice"] = "auto"
+		parallelToolCalls := true
+		if val, ok := options["parallel_tool_calls"].(bool); ok {
+			parallelToolCalls = val
+		}
+		requestBody["parallel_tool_calls"] = parallelToolCalls
 	}
 
 	if maxTokens, ok := asInt(options["max_tokens"]); ok {
@@ -108,47 +113,73 @@ func (p *Provider) Chat(
 		requestBody["prompt_cache_key"] = cacheKey
 	}
 
-	jsonData, err := json.Marshal(requestBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
+	doResponsesRequest := func(body map[string]any) ([]byte, *http.Response, string, error) {
+		jsonData, marshalErr := json.Marshal(body)
+		if marshalErr != nil {
+			return nil, nil, "", fmt.Errorf("failed to marshal request: %w", marshalErr)
+		}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", p.apiBase+"/responses", bytes.NewReader(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
+		req, reqErr := http.NewRequestWithContext(ctx, "POST", p.apiBase+"/responses", bytes.NewReader(jsonData))
+		if reqErr != nil {
+			return nil, nil, "", fmt.Errorf("failed to create request: %w", reqErr)
+		}
 
-	req.Header.Set("Content-Type", "application/json")
-	if p.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	}
+		req.Header.Set("Content-Type", "application/json")
+		if p.apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+p.apiKey)
+		}
 
-	requestURL := sanitizedURL(req.URL)
-	logger.DebugCF("openai_compat", "Sending responses request", map[string]any{
-		"url":           requestURL,
-		"model":         model,
-		"messages":      len(messages),
-		"tools":         len(tools),
-		"request_bytes": len(jsonData),
-	})
-
-	start := time.Now()
-
-	resp, err := p.httpClient.Do(req)
-	if err != nil {
-		logger.DebugCF("openai_compat", "Responses request failed before response", map[string]any{
-			"url":        requestURL,
-			"model":      model,
-			"latency_ms": time.Since(start).Milliseconds(),
-			"error":      err.Error(),
+		requestURL := sanitizedURL(req.URL)
+		logger.DebugCF("openai_compat", "Sending responses request", map[string]any{
+			"url":                 requestURL,
+			"model":               model,
+			"messages":            len(messages),
+			"tools":               len(tools),
+			"parallel_tool_calls": body["parallel_tool_calls"],
+			"request_bytes":       len(jsonData),
 		})
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+		start := time.Now()
+		resp, doErr := p.httpClient.Do(req)
+		if doErr != nil {
+			logger.DebugCF("openai_compat", "Responses request failed before response", map[string]any{
+				"url":        requestURL,
+				"model":      model,
+				"latency_ms": time.Since(start).Milliseconds(),
+				"error":      doErr.Error(),
+			})
+			return nil, nil, requestURL, fmt.Errorf("failed to send request: %w", doErr)
+		}
+		defer resp.Body.Close()
+
+		payload, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return nil, nil, requestURL, fmt.Errorf("failed to read response: %w", readErr)
+		}
+
+		return payload, resp, requestURL, nil
+	}
+
+	body, resp, requestURL, err := doResponsesRequest(requestBody)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		if requestBody["parallel_tool_calls"] == true &&
+			(resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity) &&
+			strings.Contains(strings.ToLower(string(body)), "parallel_tool_calls") {
+			logger.DebugCF("openai_compat", "Retrying request without parallel_tool_calls due to endpoint incompatibility", map[string]any{
+				"url":         requestURL,
+				"model":       model,
+				"status_code": resp.StatusCode,
+			})
+			delete(requestBody, "parallel_tool_calls")
+			body, resp, requestURL, err = doResponsesRequest(requestBody)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -164,7 +195,6 @@ func (p *Provider) Chat(
 			"url":            requestURL,
 			"model":          model,
 			"status_code":    resp.StatusCode,
-			"latency_ms":     time.Since(start).Milliseconds(),
 			"response_bytes": len(body),
 			"request_id":     requestID,
 			"server":         resp.Header.Get("server"),

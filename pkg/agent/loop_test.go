@@ -203,6 +203,74 @@ func TestRunAgentLoop_EmptyDefaultResponseStillReturnsNonEmpty(t *testing.T) {
 	require.Equal(t, nonEmptyDefaultResponse, response)
 }
 
+// TestRunAgentLoop_ForceFinalTextAfterToolLoopExhaustion verifies loop exhaustion still yields textual output via no-tool finalization call.
+// The t parameter controls test lifecycle and assertions.
+// It returns no value and fails when final text is lost after max iterations with only tool calls.
+func TestRunAgentLoop_ForceFinalTextAfterToolLoopExhaustion(t *testing.T) {
+	tmpDir := t.TempDir()
+	provider := &toolLoopExhaustionProvider{forcedFinalResponse: "Ottawa potholes can be reported via 311 web portal or phone."}
+	agentInstance := &AgentInstance{
+		ID:             "main",
+		Model:          "test-model",
+		MaxIterations:  1,
+		MaxTokens:      1024,
+		Temperature:    0,
+		Provider:       provider,
+		Sessions:       session.NewSessionManager(filepath.Join(tmpDir, "sessions")),
+		ContextBuilder: NewContextBuilder(tmpDir),
+		Tools:          tools.NewToolRegistry(),
+	}
+
+	al := &AgentLoop{bus: bus.NewMessageBus()}
+	response, err := al.runAgentLoop(context.Background(), agentInstance, processOptions{
+		SessionKey:      "agent:main:test:tool-loop-finalize",
+		Channel:         plannerTaskChannel,
+		ChatID:          "task-2026-02-26-0099",
+		UserMessage:     "Research where to report road potholes in Ottawa",
+		DefaultResponse: plannerEmptySummaryText,
+		EnableSummary:   false,
+		SendResponse:    false,
+		NoHistory:       true,
+	})
+	require.NoError(t, err)
+	require.True(t, provider.sawNoToolsCall)
+	require.Equal(t, "Ottawa potholes can be reported via 311 web portal or phone.", response)
+}
+
+// TestRunAgentLoop_ForceFinalTextFallbackToDefault verifies fallback response is preserved when forced no-tool call still has empty content.
+// The t parameter controls test lifecycle and assertions.
+// It returns no value and fails when backward-compatible default fallback behavior regresses.
+func TestRunAgentLoop_ForceFinalTextFallbackToDefault(t *testing.T) {
+	tmpDir := t.TempDir()
+	provider := &toolLoopExhaustionProvider{forcedFinalResponse: "   "}
+	agentInstance := &AgentInstance{
+		ID:             "main",
+		Model:          "test-model",
+		MaxIterations:  1,
+		MaxTokens:      1024,
+		Temperature:    0,
+		Provider:       provider,
+		Sessions:       session.NewSessionManager(filepath.Join(tmpDir, "sessions")),
+		ContextBuilder: NewContextBuilder(tmpDir),
+		Tools:          tools.NewToolRegistry(),
+	}
+
+	al := &AgentLoop{bus: bus.NewMessageBus()}
+	response, err := al.runAgentLoop(context.Background(), agentInstance, processOptions{
+		SessionKey:      "agent:main:test:tool-loop-fallback",
+		Channel:         plannerTaskChannel,
+		ChatID:          "task-2026-02-26-0100",
+		UserMessage:     "Research where to report road potholes in Ottawa",
+		DefaultResponse: plannerEmptySummaryText,
+		EnableSummary:   false,
+		SendResponse:    false,
+		NoHistory:       true,
+	})
+	require.NoError(t, err)
+	require.True(t, provider.sawNoToolsCall)
+	require.Equal(t, plannerEmptySummaryText, response)
+}
+
 // TestBuildDelegationReference_IncludesSummaryHistoryMemory verifies delegated reference payload contains key context blocks.
 // It seeds summary, recent messages, and long-term memory then validates formatted output.
 // It returns no value and fails test on missing sections.
@@ -606,6 +674,12 @@ type simpleMockProvider struct {
 	response string
 }
 
+type toolLoopExhaustionProvider struct {
+	forcedFinalResponse string
+	callCount           int
+	sawNoToolsCall      bool
+}
+
 type recordingMockProvider struct {
 	response     string
 	lastMessages []providers.Message
@@ -644,6 +718,39 @@ func (m *simpleMockProvider) Chat(
 }
 
 func (m *simpleMockProvider) GetDefaultModel() string {
+	return "mock-model"
+}
+
+// Chat returns perpetual tool calls for normal iterations and a textual answer for forced no-tool finalization.
+// The ctx, messages, model, and opts parameters satisfy provider interface requirements for test execution.
+// It returns a tool call when tools are allowed and forcedFinalResponse when tools are disabled.
+func (m *toolLoopExhaustionProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	m.callCount++
+	if len(tools) == 0 {
+		m.sawNoToolsCall = true
+		return &providers.LLMResponse{Content: m.forcedFinalResponse}, nil
+	}
+
+	return &providers.LLMResponse{
+		Content: "",
+		ToolCalls: []providers.ToolCall{{
+			ID:        "loop-tool-1",
+			Type:      "function",
+			Name:      "unknown_tool",
+			Arguments: map[string]any{},
+		}},
+	}, nil
+}
+
+// GetDefaultModel returns a static model name for this test provider.
+// It accepts no parameters and returns deterministic model metadata.
+func (m *toolLoopExhaustionProvider) GetDefaultModel() string {
 	return "mock-model"
 }
 

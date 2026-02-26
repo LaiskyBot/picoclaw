@@ -13,55 +13,7 @@ PicoClaw is a Go-first, ultra-lightweight personal AI assistant designed to run 
 PicoClaw has two primary runtime modes, both sharing the same `pkg/agent` core logic but serving different deployment goals:
 
 - `picoclaw agent`: direct single-process interaction mode for local usage and debugging.
-    - Supports one-shot (`-m`) and interactive CLI chat.
-    - Handles input/output in-process without starting channel adapters or HTTP health endpoints.
-    - Best for onboarding validation, prompt/tool debugging, and local development loops.
 - `picoclaw gateway`: long-running service mode for production-like operation.
-    - Starts enabled channel adapters (Telegram/Discord/Slack/Feishu/OneBot/WeCom/etc.) and routes all inbound/outbound events through `pkg/bus`.
-    - Runs background capabilities (cron jobs, heartbeat tasks, optional device event service).
-    - Exposes health/readiness endpoints via `pkg/health` for process supervision.
-
-Design intent: keep `agent` simple for fast iteration, and keep `gateway` reliable for continuous multi-channel automation.
-
-### Core Runtime Architecture
-
-The main runtime path is:
-
-1. channel adapters receive user messages and publish them to `pkg/bus`.
-2. `pkg/agent` (`AgentLoop`) consumes inbound messages, resolves target agent/session via `pkg/routing`, and executes model + tool loops.
-3. responses are published back to the bus and dispatched by `pkg/channels`.
-
-In `agent` mode, this pipeline is used in direct form (`ProcessDirect`) without channel manager startup.
-In `gateway` mode, the full bus + channels + background services stack is enabled.
-
-Keep this message-bus-driven flow consistent when adding features: avoid coupling channel logic directly to provider or tool internals.
-
-### Configuration Model
-
-Configuration is JSON-based with env override support in `pkg/config`.
-
-- Prefer `model_list` + `agents.defaults.model_name` for model/provider selection.
-- `providers` is still supported for compatibility but is gradually deprecated.
-- Multi-agent routing is configured through `agents.list` + `bindings` + `session` fields.
-- New config fields must be backward-compatible and covered by tests in `pkg/config`.
-
-### Main Modules (Where to Change What)
-
-- `cmd/picoclaw`: CLI commands and entrypoints.
-- `pkg/agent`: core LLM loop, context/memory handling, tool orchestration.
-- `pkg/providers`: provider factory, auth-backed providers, fallback/cooldown logic.
-- `pkg/channels`: platform adapters (Telegram, Discord, Feishu, Slack, OneBot, WeCom, etc.).
-- `pkg/routing`: agent/session routing and key generation.
-- `pkg/tools` and `pkg/skills`: built-in tools, web search/fetch, and skill registry integration.
-
-### Development Expectations for New Contributors
-
-- Prioritize low-memory, low-dependency implementations suitable for edge hardware.
-- Keep channel, routing, provider, and tool concerns separated.
-- Preserve compatibility with existing config and command behavior unless migration is explicit.
-- Add or update unit tests close to changed modules (`*_test.go`), especially for config, routing, providers, and channels.
-
-Local tools and debugging related sensitive information is saved in `.github/instructions/laisky.instructions.md`.
 
 ### Deployment
 
@@ -69,7 +21,7 @@ Users communicate with the agent through Telegram, Discord, Slack, Feishu, WeCom
 
 Configuration file location: `~/.picoclaw/config.json`
 
-Your working directory is `~/.picoclaw/workspace/`, and you can read/write files here to store important information or accomplish tasks.
+Agent's working directory is `~/.picoclaw/workspace/`, and you can read/write files here to store important information or accomplish tasks.
 
 ```sh
 make install

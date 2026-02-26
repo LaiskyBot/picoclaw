@@ -324,6 +324,46 @@ func TestPublishTaskFinalReport_FailureSendsProminentError(t *testing.T) {
 	require.Contains(t, outbound.Content, "Error: planner finished without textual summary")
 }
 
+// TestExecutePlannerTask_RecoversTextAfterToolLoopExhaustion verifies delegated planner tasks no longer fail when the model keeps requesting tools.
+// The t parameter controls setup and assertions for planner runtime and final user report.
+// It returns no value and fails when empty planner summaries still produce task failure.
+func TestExecutePlannerTask_RecoversTextAfterToolLoopExhaustion(t *testing.T) {
+	tmpDir := t.TempDir()
+	msgBus := bus.NewMessageBus()
+	provider := &toolLoopExhaustionProvider{forcedFinalResponse: "Ottawa potholes can be reported through 311 online or by phone."}
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         2048,
+				MaxToolIterations: 1,
+			},
+		},
+	}
+
+	al := NewAgentLoop(cfg, msgBus, provider)
+	task, err := al.taskPipeline.EnqueueTask("telegram", "chat-rt", "user-rt", "report pothole in Ottawa", "report pothole in Ottawa")
+	require.NoError(t, err)
+
+	al.executePlannerTask(context.Background(), task)
+
+	updated, ok := al.taskPipeline.GetTaskByID(task.ID)
+	require.True(t, ok)
+	require.Equal(t, TaskStatusDone, updated.Status)
+	require.Equal(t, "Ottawa potholes can be reported through 311 online or by phone.", updated.PlannerResult)
+	require.True(t, provider.sawNoToolsCall)
+
+	readCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	outbound, ok := msgBus.SubscribeOutbound(readCtx)
+	require.True(t, ok)
+	require.Equal(t, "telegram", outbound.Channel)
+	require.Equal(t, "chat-rt", outbound.ChatID)
+	require.Contains(t, outbound.Content, "Ottawa potholes can be reported through 311 online or by phone.")
+	require.NotContains(t, outbound.Content, "Task failed")
+}
+
 // TestMatchStatusQuery_UrlStatusPathDoesNotTrigger verifies URLs containing /status/ do not trigger task status intent.
 // The t parameter controls test lifecycle and assertions.
 // It returns no value and fails when URL-only status tokens are misclassified.
@@ -665,6 +705,7 @@ func TestBuildPlannerDelegationPrompt_IncludesDelegationContext(t *testing.T) {
 	require.Contains(t, prompt, "Task tracking id: task-2026-02-25-0001")
 	require.Contains(t, prompt, "Delegation reference (memory and interaction history):")
 	require.Contains(t, prompt, "root cause first")
+	require.Contains(t, prompt, "issue parallel tool calls in the same turn")
 	require.Contains(t, prompt, "deliver them via the message tool using attachments")
 	require.Contains(t, prompt, "Never claim media was sent unless the message tool call already succeeded")
 	require.Contains(t, prompt, "Do not output placeholders such as [Sending image]")

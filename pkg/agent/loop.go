@@ -793,6 +793,34 @@ func (al *AgentLoop) runLLMIteration(
 	iteration := 0
 	var finalContent string
 	sawToolCalls := false
+	llmCall := func(callCtx context.Context, reqMessages []providers.Message, reqToolDefs []providers.ToolDefinition, iter int) (*providers.LLMResponse, error) {
+		callOptions := map[string]any{
+			"max_tokens":       agent.MaxTokens,
+			"temperature":      agent.Temperature,
+			"prompt_cache_key": agent.ID,
+		}
+		if len(reqToolDefs) > 0 {
+			callOptions["parallel_tool_calls"] = true
+		}
+
+		if len(agent.Candidates) > 0 && al.fallback != nil {
+			fbResult, fbErr := al.fallback.Execute(callCtx, agent.Candidates,
+				func(ctx context.Context, provider, model string) (*providers.LLMResponse, error) {
+					return agent.Provider.Chat(ctx, reqMessages, reqToolDefs, model, callOptions)
+				},
+			)
+			if fbErr != nil {
+				return nil, fbErr
+			}
+			if fbResult.Provider != "" && len(fbResult.Attempts) > 0 {
+				logger.InfoCF("agent", fmt.Sprintf("Fallback: succeeded with %s/%s after %d attempts",
+					fbResult.Provider, fbResult.Model, len(fbResult.Attempts)+1),
+					map[string]any{"agent_id": agent.ID, "iteration": iter})
+			}
+			return fbResult.Response, nil
+		}
+		return agent.Provider.Chat(callCtx, reqMessages, reqToolDefs, agent.Model, callOptions)
+	}
 
 	for iteration < agent.MaxIterations {
 		iteration++
@@ -832,38 +860,10 @@ func (al *AgentLoop) runLLMIteration(
 		var response *providers.LLMResponse
 		var err error
 
-		callLLM := func() (*providers.LLMResponse, error) {
-			if len(agent.Candidates) > 0 && al.fallback != nil {
-				fbResult, fbErr := al.fallback.Execute(ctx, agent.Candidates,
-					func(ctx context.Context, provider, model string) (*providers.LLMResponse, error) {
-						return agent.Provider.Chat(ctx, messages, providerToolDefs, model, map[string]any{
-							"max_tokens":       agent.MaxTokens,
-							"temperature":      agent.Temperature,
-							"prompt_cache_key": agent.ID,
-						})
-					},
-				)
-				if fbErr != nil {
-					return nil, fbErr
-				}
-				if fbResult.Provider != "" && len(fbResult.Attempts) > 0 {
-					logger.InfoCF("agent", fmt.Sprintf("Fallback: succeeded with %s/%s after %d attempts",
-						fbResult.Provider, fbResult.Model, len(fbResult.Attempts)+1),
-						map[string]any{"agent_id": agent.ID, "iteration": iteration})
-				}
-				return fbResult.Response, nil
-			}
-			return agent.Provider.Chat(ctx, messages, providerToolDefs, agent.Model, map[string]any{
-				"max_tokens":       agent.MaxTokens,
-				"temperature":      agent.Temperature,
-				"prompt_cache_key": agent.ID,
-			})
-		}
-
 		// Retry loop for context/token errors
 		maxRetries := 2
 		for retry := 0; retry <= maxRetries; retry++ {
-			response, err = callLLM()
+			response, err = llmCall(ctx, messages, providerToolDefs, iteration)
 			if err == nil {
 				break
 			}
@@ -916,6 +916,14 @@ func (al *AgentLoop) runLLMIteration(
 			return "", iteration, fmt.Errorf("LLM call failed after retries: %w", err)
 		}
 
+		logger.DebugCF("agent", "LLM response metadata", map[string]any{
+			"agent_id":        agent.ID,
+			"iteration":       iteration,
+			"content_chars":   len(strings.TrimSpace(response.Content)),
+			"reasoning_chars": len(strings.TrimSpace(response.ReasoningContent)),
+			"tool_calls":      len(response.ToolCalls),
+		})
+
 		// Check if no tool calls - we're done
 		if len(response.ToolCalls) == 0 {
 			finalContent = response.Content
@@ -946,6 +954,52 @@ func (al *AgentLoop) runLLMIteration(
 				"iteration": iteration,
 			})
 		sawToolCalls = true
+
+		if iteration == agent.MaxIterations {
+			if strings.TrimSpace(response.Content) != "" {
+				logger.WarnCF("agent", "Max iterations reached with tool calls; using assistant textual content without executing tools", map[string]any{
+					"agent_id":       agent.ID,
+					"session_key":    opts.SessionKey,
+					"channel":        opts.Channel,
+					"chat_id":        opts.ChatID,
+					"max_iterations": agent.MaxIterations,
+					"content_chars":  len(strings.TrimSpace(response.Content)),
+				})
+				finalContent = response.Content
+				break
+			}
+
+			forcedSummary, forceErr := al.forceFinalTextAfterToolLoop(ctx, agent, messages, iteration, llmCall)
+			if forceErr != nil {
+				logger.WarnCF("agent", "Forced final textual response after tool loop exhaustion failed", map[string]any{
+					"agent_id":       agent.ID,
+					"iteration":      iteration,
+					"max_iterations": agent.MaxIterations,
+					"error":          forceErr.Error(),
+				})
+			}
+			if strings.TrimSpace(forcedSummary) != "" {
+				logger.WarnCF("agent", "Recovered textual response after tool loop exhaustion", map[string]any{
+					"agent_id":       agent.ID,
+					"session_key":    opts.SessionKey,
+					"channel":        opts.Channel,
+					"chat_id":        opts.ChatID,
+					"max_iterations": agent.MaxIterations,
+					"content_chars":  len(strings.TrimSpace(forcedSummary)),
+				})
+				finalContent = forcedSummary
+				break
+			}
+
+			logger.WarnCF("agent", "Max iterations reached with tool calls and no textual content; ending loop without executing additional tools", map[string]any{
+				"agent_id":       agent.ID,
+				"session_key":    opts.SessionKey,
+				"channel":        opts.Channel,
+				"chat_id":        opts.ChatID,
+				"max_iterations": agent.MaxIterations,
+			})
+			break
+		}
 
 		// Build assistant message with tool calls
 		assistantMsg := providers.Message{
@@ -1056,6 +1110,16 @@ func (al *AgentLoop) runLLMIteration(
 				contentForLLM = toolResult.Err.Error()
 			}
 
+			logger.DebugCF("agent", "Tool execution output metadata", map[string]any{
+				"agent_id":         agent.ID,
+				"iteration":        iteration,
+				"tool":             tc.Name,
+				"for_llm_chars":    len(strings.TrimSpace(contentForLLM)),
+				"for_user_chars":   len(strings.TrimSpace(toolResult.ForUser)),
+				"silent":           toolResult.Silent,
+				"has_error":        toolResult.Err != nil,
+			})
+
 			toolResultMsg := providers.Message{
 				Role:       "tool",
 				Content:    contentForLLM,
@@ -1079,6 +1143,43 @@ func (al *AgentLoop) runLLMIteration(
 	}
 
 	return finalContent, iteration, nil
+}
+
+// forceFinalTextAfterToolLoop asks the model to return a textual answer when tool budget is exhausted.
+// The ctx parameter controls request cancellation, agent holds model/provider settings, messages is the current conversation state,
+// and iteration records the active turn for logs. The llmCall parameter performs one provider call with caller-selected tools.
+// It returns the best-effort textual response and any provider execution error.
+func (al *AgentLoop) forceFinalTextAfterToolLoop(
+	ctx context.Context,
+	agent *AgentInstance,
+	messages []providers.Message,
+	iteration int,
+	llmCall func(context.Context, []providers.Message, []providers.ToolDefinition, int) (*providers.LLMResponse, error),
+) (string, error) {
+	forcedMessages := append([]providers.Message{}, messages...)
+	forcedMessages = append(forcedMessages, providers.Message{
+		Role: "system",
+		Content: "Tool-call budget is exhausted. Do not call any tools. Provide a concise final textual answer based only on existing observations. " +
+			"If information is insufficient, clearly state the uncertainty and list what is missing.",
+	})
+
+	response, err := llmCall(ctx, forcedMessages, nil, iteration)
+	if err != nil {
+		return "", err
+	}
+	if response == nil {
+		return "", nil
+	}
+
+	logger.DebugCF("agent", "Forced final textual response metadata", map[string]any{
+		"agent_id":        agent.ID,
+		"iteration":       iteration,
+		"content_chars":   len(strings.TrimSpace(response.Content)),
+		"reasoning_chars": len(strings.TrimSpace(response.ReasoningContent)),
+		"tool_calls":      len(response.ToolCalls),
+	})
+
+	return strings.TrimSpace(response.Content), nil
 }
 
 // isContextWindowError checks whether an error indicates model context/token length overflow.

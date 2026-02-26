@@ -382,6 +382,7 @@ func TestProviderChat_BuildsResponsesInputAndTools(t *testing.T) {
 	require.Equal(t, "gpt-5-mini", requestBody["model"])
 	require.Equal(t, float64(64), requestBody["max_output_tokens"])
 	require.Equal(t, "auto", requestBody["tool_choice"])
+	require.Equal(t, true, requestBody["parallel_tool_calls"])
 
 	inputItems, ok := requestBody["input"].([]any)
 	require.True(t, ok)
@@ -413,6 +414,104 @@ func TestProviderChat_BuildsResponsesInputAndTools(t *testing.T) {
 	require.Equal(t, "function", toolDef["type"])
 	require.Equal(t, "get_time", toolDef["name"])
 	require.Equal(t, "Get time by timezone", toolDef["description"])
+}
+
+func TestProviderChat_DisablesParallelToolCallsWhenRequested(t *testing.T) {
+	var requestBody map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/responses", r.URL.Path)
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&requestBody))
+
+		resp := map[string]any{
+			"status": "completed",
+			"output": []map[string]any{
+				{
+					"type": "message",
+					"content": []map[string]any{
+						{"type": "output_text", "text": "ok"},
+					},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	p := NewProvider("key", server.URL, "")
+	_, err := p.Chat(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		[]ToolDefinition{{
+			Type: "function",
+			Function: ToolFunctionDefinition{
+				Name:        "get_time",
+				Description: "Get time by timezone",
+				Parameters: map[string]any{
+					"type": "object",
+				},
+			},
+		}},
+		"gpt-5-mini",
+		map[string]any{"parallel_tool_calls": false},
+	)
+	require.NoError(t, err)
+	require.Equal(t, false, requestBody["parallel_tool_calls"])
+}
+
+func TestProviderChat_RetriesWithoutParallelToolCallsWhenUnsupported(t *testing.T) {
+	requestBodies := make([]map[string]any, 0, 2)
+	requestCount := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		var body map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		requestBodies = append(requestBodies, body)
+
+		if requestCount == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"unknown field: parallel_tool_calls"}}`))
+			return
+		}
+
+		resp := map[string]any{
+			"status": "completed",
+			"output": []map[string]any{
+				{
+					"type": "message",
+					"content": []map[string]any{{"type": "output_text", "text": "ok"}},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	p := NewProvider("key", server.URL, "")
+	_, err := p.Chat(
+		t.Context(),
+		[]Message{{Role: "user", Content: "hi"}},
+		[]ToolDefinition{{
+			Type: "function",
+			Function: ToolFunctionDefinition{
+				Name:        "get_time",
+				Description: "Get time by timezone",
+				Parameters: map[string]any{
+					"type": "object",
+				},
+			},
+		}},
+		"gpt-5-mini",
+		nil,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 2, requestCount)
+	require.Equal(t, true, requestBodies[0]["parallel_tool_calls"])
+	_, exists := requestBodies[1]["parallel_tool_calls"]
+	require.False(t, exists)
 }
 
 func TestProviderChat_ParsesMessageOutputAndUsage(t *testing.T) {
