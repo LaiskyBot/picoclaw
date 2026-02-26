@@ -15,6 +15,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/providers"
+	"github.com/sipeed/picoclaw/pkg/session"
 	"github.com/sipeed/picoclaw/pkg/tools"
 	"github.com/stretchr/testify/require"
 )
@@ -492,6 +493,12 @@ type mockContextualTool struct {
 	lastChatID  string
 }
 
+// mockMessageContextTool tracks context updates for the message tool slot.
+type mockMessageContextTool struct {
+	lastChannel string
+	lastChatID  string
+}
+
 func (m *mockContextualTool) Name() string {
 	return "mock_contextual"
 }
@@ -516,6 +523,41 @@ func (m *mockContextualTool) SetContext(channel, chatID string) {
 	m.lastChatID = chatID
 }
 
+// Name returns the registered tool name.
+// It accepts no parameters and returns the tool identifier.
+func (m *mockMessageContextTool) Name() string {
+	return "message"
+}
+
+// Description describes the test tool behavior.
+// It accepts no parameters and returns a static description.
+func (m *mockMessageContextTool) Description() string {
+	return "Mock message contextual tool"
+}
+
+// Parameters returns JSON schema for test tool arguments.
+// It accepts no parameters and returns an empty object schema.
+func (m *mockMessageContextTool) Parameters() map[string]any {
+	return map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	}
+}
+
+// Execute returns a silent result for this mock.
+// The ctx and args parameters are ignored in this test implementation.
+// It returns a successful silent tool result.
+func (m *mockMessageContextTool) Execute(ctx context.Context, args map[string]any) *tools.ToolResult {
+	return tools.SilentResult("ok")
+}
+
+// SetContext captures the last channel/chat pair passed by the agent runtime.
+// The channel and chatID parameters are stored for assertions and no value is returned.
+func (m *mockMessageContextTool) SetContext(channel, chatID string) {
+	m.lastChannel = channel
+	m.lastChatID = chatID
+}
+
 // testHelper executes a message and returns the response
 type testHelper struct {
 	al *AgentLoop
@@ -534,6 +576,45 @@ func (h testHelper) executeAndGetResponse(tb testing.TB, ctx context.Context, ms
 }
 
 const responseTimeout = 3 * time.Second
+
+// TestRunAgentLoop_UsesToolContextOverrides verifies planner runtime can keep internal session IDs while tools target user chat.
+// It runs one loop iteration and asserts message tool context receives ToolChannel/ToolChatID values.
+// It returns no value and fails when override routing is not applied.
+func TestRunAgentLoop_UsesToolContextOverrides(t *testing.T) {
+	tmpDir := t.TempDir()
+	provider := &simpleMockProvider{response: "done"}
+	messageTool := &mockMessageContextTool{}
+
+	agentInstance := &AgentInstance{
+		ID:            "main",
+		Model:         "test-model",
+		MaxIterations: 1,
+		MaxTokens:     1024,
+		Temperature:   0,
+		Provider:      provider,
+		Sessions:      session.NewSessionManager(filepath.Join(tmpDir, "sessions")),
+		ContextBuilder: NewContextBuilder(tmpDir),
+		Tools:         tools.NewToolRegistry(),
+	}
+	agentInstance.Tools.Register(messageTool)
+
+	al := &AgentLoop{bus: bus.NewMessageBus()}
+	_, err := al.runAgentLoop(context.Background(), agentInstance, processOptions{
+		SessionKey:      "agent:main:pipeline:task-2026-02-26-0014",
+		Channel:         plannerTaskChannel,
+		ChatID:          "task-2026-02-26-0014",
+		ToolChannel:     "telegram",
+		ToolChatID:      "861999008",
+		UserMessage:     "send screenshot",
+		DefaultResponse: "empty",
+		EnableSummary:   false,
+		SendResponse:    false,
+		NoHistory:       true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "telegram", messageTool.lastChannel)
+	require.Equal(t, "861999008", messageTool.lastChatID)
+}
 
 // TestToolResult_SilentToolDoesNotSendUserMessage verifies silent tools don't trigger outbound
 func TestToolResult_SilentToolDoesNotSendUserMessage(t *testing.T) {

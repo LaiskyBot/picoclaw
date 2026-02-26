@@ -144,6 +144,8 @@ func (al *AgentLoop) executePlannerTask(parentCtx context.Context, task *Pipelin
 		SessionKey:      sessionKey,
 		Channel:         plannerTaskChannel,
 		ChatID:          task.ID,
+		ToolChannel:     task.Channel,
+		ToolChatID:      task.ChatID,
 		UserMessage:     plannerPrompt,
 		DefaultResponse: plannerEmptySummaryText,
 		EnableSummary:   false,

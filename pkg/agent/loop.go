@@ -48,6 +48,8 @@ type processOptions struct {
 	SessionKey      string // Session identifier for history/context
 	Channel         string // Target channel for tool execution
 	ChatID          string // Target chat ID for tool execution
+	ToolChannel     string // Optional channel override used only for tool context injection
+	ToolChatID      string // Optional chat ID override used only for tool context injection
 	UserMessage     string // User message content (may include prefix)
 	DefaultResponse string // Response when LLM returns empty
 	EnableSummary   bool   // Whether to trigger summarization
@@ -566,7 +568,15 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	delegationReference := buildDelegationReference(agent, history, summary)
 
 	// 2. Update tool contexts
-	al.updateToolContexts(agent, opts.Channel, opts.ChatID, delegationReference)
+	toolChannel := opts.Channel
+	if strings.TrimSpace(opts.ToolChannel) != "" {
+		toolChannel = strings.TrimSpace(opts.ToolChannel)
+	}
+	toolChatID := opts.ChatID
+	if strings.TrimSpace(opts.ToolChatID) != "" {
+		toolChatID = strings.TrimSpace(opts.ToolChatID)
+	}
+	al.updateToolContexts(agent, toolChannel, toolChatID, delegationReference)
 
 	// 3. Build messages
 	messages := agent.ContextBuilder.BuildMessages(

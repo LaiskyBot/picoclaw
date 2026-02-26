@@ -3,10 +3,15 @@ package tools
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
+	"github.com/sipeed/picoclaw/pkg/constants"
+	"github.com/sipeed/picoclaw/pkg/logger"
 )
+
+var pipelineTaskIDPattern = regexp.MustCompile(`^task-\d{4}-\d{2}-\d{2}-\d{4}$`)
 
 type SendCallback func(msg bus.OutboundMessage) error
 
@@ -129,15 +134,9 @@ func (t *MessageTool) Execute(ctx context.Context, args map[string]any) *ToolRes
 		return &ToolResult{ForLLM: "content is required", IsError: true}
 	}
 
-	channel, _ := args["channel"].(string)
-	chatID, _ := args["chat_id"].(string)
-
-	if channel == "" {
-		channel = t.defaultChannel
-	}
-	if chatID == "" {
-		chatID = t.defaultChatID
-	}
+	requestedChannel, _ := args["channel"].(string)
+	requestedChatID, _ := args["chat_id"].(string)
+	channel, chatID := t.resolveTarget(requestedChannel, requestedChatID)
 
 	if channel == "" || chatID == "" {
 		return &ToolResult{ForLLM: "No target channel/chat specified", IsError: true}
@@ -179,6 +178,69 @@ func (t *MessageTool) Execute(ctx context.Context, args map[string]any) *ToolRes
 		ForLLM: fmt.Sprintf("Message sent to %s:%s", channel, chatID),
 		Silent: true,
 	}
+}
+
+// resolveTarget normalizes outbound target channel/chat and protects against internal pipeline leakage.
+// It accepts optional requested channel/chat from tool arguments and falls back to contextual defaults.
+// It returns the final channel and chat ID used for outbound delivery.
+func (t *MessageTool) resolveTarget(requestedChannel, requestedChatID string) (string, string) {
+	channel := strings.TrimSpace(requestedChannel)
+	chatID := strings.TrimSpace(requestedChatID)
+	if channel == "" {
+		channel = strings.TrimSpace(t.defaultChannel)
+	}
+	if chatID == "" {
+		chatID = strings.TrimSpace(t.defaultChatID)
+	}
+
+	if !t.shouldRemapToDefaultTarget(channel, chatID, requestedChannel, requestedChatID) {
+		return channel, chatID
+	}
+
+	fallbackChannel := strings.TrimSpace(t.defaultChannel)
+	fallbackChatID := strings.TrimSpace(t.defaultChatID)
+	logger.DebugCF("tool", "Message tool remapped pipeline/internal target to contextual chat", map[string]any{
+		"requested_channel": requestedChannel,
+		"requested_chat_id": requestedChatID,
+		"resolved_channel":  channel,
+		"resolved_chat_id":  chatID,
+		"fallback_channel":  fallbackChannel,
+		"fallback_chat_id":  fallbackChatID,
+	})
+
+	return fallbackChannel, fallbackChatID
+}
+
+// shouldRemapToDefaultTarget reports whether outbound target should fallback to contextual defaults.
+// It accepts resolved and requested routing values, and returns true when an internal/task ID leak is detected.
+func (t *MessageTool) shouldRemapToDefaultTarget(channel, chatID, requestedChannel, requestedChatID string) bool {
+	defaultChannel := strings.TrimSpace(t.defaultChannel)
+	defaultChatID := strings.TrimSpace(t.defaultChatID)
+	if defaultChannel == "" || defaultChatID == "" {
+		return false
+	}
+
+	if constants.IsInternalChannel(strings.TrimSpace(channel)) && !constants.IsInternalChannel(defaultChannel) {
+		return true
+	}
+
+	if !constants.IsInternalChannel(defaultChannel) && looksLikePipelineTaskID(strings.TrimSpace(requestedChatID)) {
+		if strings.TrimSpace(requestedChannel) == "" || constants.IsInternalChannel(strings.TrimSpace(requestedChannel)) {
+			return true
+		}
+	}
+
+	if !constants.IsInternalChannel(defaultChannel) && looksLikePipelineTaskID(strings.TrimSpace(chatID)) {
+		return true
+	}
+
+	return false
+}
+
+// looksLikePipelineTaskID reports whether chat ID follows persisted task pipeline identifier format.
+// It accepts a chat ID string and returns true when it matches task-YYYY-MM-DD-NNNN.
+func looksLikePipelineTaskID(chatID string) bool {
+	return pipelineTaskIDPattern.MatchString(strings.TrimSpace(chatID))
 }
 
 // parseMessageAttachments converts tool argument attachments into typed outbound attachments.

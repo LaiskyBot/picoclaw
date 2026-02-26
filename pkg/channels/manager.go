@@ -284,6 +284,13 @@ func (m *Manager) dispatchOutbound(ctx context.Context) {
 
 			// Silently skip internal channels
 			if constants.IsInternalChannel(msg.Channel) {
+				logger.DebugCF("channels", "Skipped internal outbound message", map[string]any{
+					"channel":          msg.Channel,
+					"chat_id":          msg.ChatID,
+					"content_chars":    len(msg.Content),
+					"attachment_count": len(msg.Attachments),
+					"button_count":     len(msg.Buttons),
+				})
 				continue
 			}
 
@@ -300,8 +307,12 @@ func (m *Manager) dispatchOutbound(ctx context.Context) {
 
 			if err := channel.Send(ctx, msg); err != nil {
 				logger.ErrorCF("channels", "Error sending message to channel", map[string]any{
-					"channel": msg.Channel,
-					"error":   err.Error(),
+					"channel":          msg.Channel,
+					"chat_id":          msg.ChatID,
+					"content_chars":    len(msg.Content),
+					"attachment_count": len(msg.Attachments),
+					"button_count":     len(msg.Buttons),
+					"error":            err.Error(),
 				})
 			}
 		}

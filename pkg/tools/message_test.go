@@ -327,3 +327,65 @@ func TestMessageTool_Execute_InvalidButtons(t *testing.T) {
 		t.Fatal("expected error for invalid button action")
 	}
 }
+
+func TestMessageTool_Execute_RemapPipelineTaskIDToContextTarget(t *testing.T) {
+	tool := NewMessageTool()
+	tool.SetContext("telegram", "861999008")
+
+	var sent bus.OutboundMessage
+	tool.SetSendCallback(func(msg bus.OutboundMessage) error {
+		sent = msg
+		return nil
+	})
+
+	result := tool.Execute(context.Background(), map[string]any{
+		"content": "Here is your screenshot",
+		"chat_id": "task-2026-02-26-0014",
+		"attachments": []any{
+			map[string]any{
+				"type": "photo",
+				"path": "/tmp/laisky_blog.png",
+			},
+		},
+	})
+
+	if result.IsError {
+		t.Fatalf("expected success, got error: %s", result.ForLLM)
+	}
+	if sent.Channel != "telegram" {
+		t.Fatalf("expected channel telegram, got %s", sent.Channel)
+	}
+	if sent.ChatID != "861999008" {
+		t.Fatalf("expected chat id remapped to contextual target, got %s", sent.ChatID)
+	}
+	if len(sent.Attachments) != 1 {
+		t.Fatalf("expected 1 attachment, got %d", len(sent.Attachments))
+	}
+}
+
+func TestMessageTool_Execute_KeepExplicitExternalTarget(t *testing.T) {
+	tool := NewMessageTool()
+	tool.SetContext("telegram", "861999008")
+
+	var sent bus.OutboundMessage
+	tool.SetSendCallback(func(msg bus.OutboundMessage) error {
+		sent = msg
+		return nil
+	})
+
+	result := tool.Execute(context.Background(), map[string]any{
+		"content": "Forward to another chat",
+		"channel": "telegram",
+		"chat_id": "861999009",
+	})
+
+	if result.IsError {
+		t.Fatalf("expected success, got error: %s", result.ForLLM)
+	}
+	if sent.Channel != "telegram" {
+		t.Fatalf("expected channel telegram, got %s", sent.Channel)
+	}
+	if sent.ChatID != "861999009" {
+		t.Fatalf("expected explicit chat id to be preserved, got %s", sent.ChatID)
+	}
+}
