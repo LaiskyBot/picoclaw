@@ -17,10 +17,11 @@ import (
 )
 
 type ContextBuilder struct {
-	workspace    string
-	skillsLoader *skills.SkillsLoader
-	skillsFilter []string
-	memory       *MemoryStore
+	workspace     string
+	skillsLoader  *skills.SkillsLoader
+	skillsFilter  []string
+	memory        *MemoryStore
+	useFileMemory bool
 
 	// Cache for system prompt to avoid rebuilding on every call.
 	// This fixes issue #607: repeated reprocessing of the entire context.
@@ -45,16 +46,28 @@ func getGlobalConfigDir() string {
 }
 
 func NewContextBuilder(workspace string) *ContextBuilder {
+	return NewContextBuilderWithFileMemory(workspace, true)
+}
+
+// NewContextBuilderWithFileMemory creates a context builder and toggles file-based memory usage.
+// The workspace parameter defines agent workspace, and useFileMemory controls MEMORY.md prompt loading.
+func NewContextBuilderWithFileMemory(workspace string, useFileMemory bool) *ContextBuilder {
 	// builtin skills: skills directory in current project
 	// Use the skills/ directory under the current working directory
 	wd, _ := os.Getwd()
 	builtinSkillsDir := filepath.Join(wd, "skills")
 	globalSkillsDir := filepath.Join(getGlobalConfigDir(), "skills")
 
+	var memory *MemoryStore
+	if useFileMemory {
+		memory = NewMemoryStore(workspace)
+	}
+
 	return &ContextBuilder{
-		workspace:    workspace,
-		skillsLoader: skills.NewSkillsLoader(workspace, globalSkillsDir, builtinSkillsDir),
-		memory:       NewMemoryStore(workspace),
+		workspace:     workspace,
+		skillsLoader:  skills.NewSkillsLoader(workspace, globalSkillsDir, builtinSkillsDir),
+		memory:        memory,
+		useFileMemory: useFileMemory,
 	}
 }
 
@@ -78,14 +91,20 @@ func (cb *ContextBuilder) SetSkillsFilter(skillNames []string) {
 func (cb *ContextBuilder) getIdentity() string {
 	workspacePath, _ := filepath.Abs(filepath.Join(cb.workspace))
 
+	memoryOverview := fmt.Sprintf("- Memory: %s/memory/MEMORY.md\n- Daily Notes: %s/memory/YYYYMM/YYYYMMDD.md", workspacePath, workspacePath)
+	memoryRule := fmt.Sprintf("8. **Memory** - When interacting with me if something seems memorable, update %s/memory/MEMORY.md", workspacePath)
+	if !cb.useFileMemory {
+		memoryOverview = "- Memory: managed by remote MCP memory tools (memory_before_turn / memory_after_turn)"
+		memoryRule = "8. **Memory** - Memory is managed by remote MCP memory tools. Do not rely on local memory files as primary memory context."
+	}
+
 	return fmt.Sprintf(`# picoclaw 🦞
 
 You are picoclaw, a helpful AI assistant.
 
 ## Workspace
 Your workspace is at: %s
-- Memory: %s/memory/MEMORY.md
-- Daily Notes: %s/memory/YYYYMM/YYYYMMDD.md
+%s
 - Skills: %s/skills/{skill-name}/SKILL.md
 
 ## Important Rules
@@ -104,12 +123,12 @@ Your workspace is at: %s
 
 7. **Delegation quality** - When dispatching a sub-task, include enough context, clear objective, constraints, and explicit acceptance criteria so workers can execute independently and verifiably.
 
-8. **Memory** - When interacting with me if something seems memorable, update %s/memory/MEMORY.md
+%s
 
 9. **Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.
 
 10. **Output length control** - %s`,
-		workspacePath, workspacePath, workspacePath, workspacePath, workspacePath, promptLengthControlHint)
+		workspacePath, memoryOverview, workspacePath, memoryRule, promptLengthControlHint)
 }
 
 func (cb *ContextBuilder) BuildSystemPrompt() string {
@@ -140,9 +159,11 @@ Reuse installed skills first. Only use find_skills + install_skill if no install
 	}
 
 	// Memory context
-	memoryContext := cb.memory.GetMemoryContext()
-	if memoryContext != "" {
-		parts = append(parts, "# Memory\n\n"+memoryContext)
+	if cb.memory != nil {
+		memoryContext := cb.memory.GetMemoryContext()
+		if memoryContext != "" {
+			parts = append(parts, "# Memory\n\n"+memoryContext)
+		}
 	}
 
 	// Join with "---" separator
@@ -210,13 +231,17 @@ func (cb *ContextBuilder) InvalidateCache() {
 // separately in sourceFilesChangedLocked because it requires both directory-
 // level and recursive file-level mtime checks.
 func (cb *ContextBuilder) sourcePaths() []string {
-	return []string{
+	paths := []string{
 		filepath.Join(cb.workspace, "AGENTS.md"),
 		filepath.Join(cb.workspace, "SOUL.md"),
 		filepath.Join(cb.workspace, "USER.md"),
 		filepath.Join(cb.workspace, "IDENTITY.md"),
-		filepath.Join(cb.workspace, "memory", "MEMORY.md"),
 	}
+	if cb.useFileMemory {
+		paths = append(paths, filepath.Join(cb.workspace, "memory", "MEMORY.md"))
+	}
+
+	return paths
 }
 
 // cacheBaseline holds the file existence snapshot and the latest observed

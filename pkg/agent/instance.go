@@ -58,7 +58,8 @@ func NewAgentInstance(
 	sessionsDir := filepath.Join(workspace, "sessions")
 	sessionsManager := session.NewSessionManager(sessionsDir)
 
-	contextBuilder := NewContextBuilder(workspace)
+	useFileMemory := !hasLaiskyMemoryMCPRemote(cfg.Tools.MCP.Remote)
+	contextBuilder := NewContextBuilderWithFileMemory(workspace, useFileMemory)
 
 	agentID := routing.DefaultAgentID
 	agentName := ""

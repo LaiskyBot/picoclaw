@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -44,6 +47,127 @@ func TestBuildConfiguredRemoteMCPServers(t *testing.T) {
 	require.Equal(t, "zeta", servers[1].Name)
 	require.Equal(t, "https://alpha.example.com/mcp", servers[0].URL)
 	require.Equal(t, "Bearer token", servers[0].Headers["Authorization"])
+}
+
+// TestRunAgentLoop_UsesMCPMemoryLifecycle verifies laisky MCP memory hooks run before/after model turns.
+// It configures mcp.laisky.com, injects mock MCP responses, and ensures recall is appended while file memory is disabled.
+// It returns no value and fails when before/after lifecycle behavior is incorrect.
+func TestRunAgentLoop_UsesMCPMemoryLifecycle(t *testing.T) {
+	tmpDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, "memory"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "memory", "MEMORY.md"), []byte("FILE_MEMORY_SHOULD_NOT_APPEAR"), 0o644))
+
+	var mu sync.Mutex
+	var capturedBeforeArgs map[string]any
+	var capturedAfterArgs map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		var req map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+
+		method, _ := req["method"].(string)
+		switch method {
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", "memory-session-1")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req["id"],
+				"result":  map[string]any{"protocolVersion": "2024-11-05"},
+			})
+		case "tools/call":
+			params, _ := req["params"].(map[string]any)
+			name, _ := params["name"].(string)
+			arguments, _ := params["arguments"].(map[string]any)
+
+			switch name {
+			case memoryBeforeToolName:
+				mu.Lock()
+				capturedBeforeArgs = arguments
+				mu.Unlock()
+
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req["id"],
+					"result": map[string]any{
+						"content": []map[string]any{{
+							"type": "text",
+							"text": `{"input_items":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"Memory recall: project prefers concise updates."}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hello memory"}]}]}`,
+						}},
+					},
+				})
+			case memoryAfterToolName:
+				mu.Lock()
+				capturedAfterArgs = arguments
+				mu.Unlock()
+
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req["id"],
+					"result": map[string]any{
+						"content": []map[string]any{{
+							"type": "text",
+							"text": `{"ok":true}`,
+						}},
+					},
+				})
+			default:
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req["id"], "error": map[string]any{"code": -32601, "message": "method not found"}})
+			}
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	recordingProvider := &recordingMockProvider{response: "done"}
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = tmpDir
+	cfg.Agents.Defaults.Model = "test-model"
+	cfg.Tools.MCP.Remote = map[string]config.RemoteMCPServerConfig{
+		"laisky": {
+			Type: "http",
+			URL:  "https://mcp.laisky.com",
+			Headers: map[string]string{
+				"Authorization": "Bearer test-token",
+			},
+		},
+	}
+
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), recordingProvider)
+	require.NotNil(t, al.memoryMCP)
+	al.memoryMCP.endpoint = server.URL
+
+	defaultAgent := al.registry.GetDefaultAgent()
+	require.NotNil(t, defaultAgent)
+
+	response, err := al.runAgentLoop(context.Background(), defaultAgent, processOptions{
+		SessionKey:      "session-1",
+		Channel:         "telegram",
+		ChatID:          "chat-1",
+		UserMessage:     "hello memory",
+		DefaultResponse: "empty",
+		EnableSummary:   false,
+		SendResponse:    false,
+	})
+	require.NoError(t, err)
+	require.Equal(t, "done", response)
+
+	require.NotEmpty(t, recordingProvider.lastMessages)
+	systemPrompt := recordingProvider.lastMessages[0].Content
+	require.Contains(t, systemPrompt, "MCP Memory Recall")
+	require.Contains(t, systemPrompt, "project prefers concise updates")
+	require.NotContains(t, systemPrompt, "FILE_MEMORY_SHOULD_NOT_APPEAR")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotNil(t, capturedBeforeArgs)
+	require.NotNil(t, capturedAfterArgs)
+	require.Equal(t, capturedBeforeArgs["turn_id"], capturedAfterArgs["turn_id"])
+	require.Equal(t, "session-1", capturedBeforeArgs["session_id"])
+	require.Equal(t, "session-1", capturedAfterArgs["session_id"])
 }
 
 // TestBuildDelegationReference_IncludesSummaryHistoryMemory verifies delegated reference payload contains key context blocks.
@@ -447,6 +571,30 @@ func TestAgentLoop_Stop(t *testing.T) {
 
 type simpleMockProvider struct {
 	response string
+}
+
+type recordingMockProvider struct {
+	response     string
+	lastMessages []providers.Message
+}
+
+// Chat records the latest message list and returns static response text.
+// The messages parameter contains provider prompt input for assertions, and return value is a successful response.
+func (m *recordingMockProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	m.lastMessages = append([]providers.Message(nil), messages...)
+	return &providers.LLMResponse{Content: m.response}, nil
+}
+
+// GetDefaultModel returns the mock provider default model name.
+// It takes no parameters and returns a static model identifier.
+func (m *recordingMockProvider) GetDefaultModel() string {
+	return "mock-model"
 }
 
 func (m *simpleMockProvider) Chat(

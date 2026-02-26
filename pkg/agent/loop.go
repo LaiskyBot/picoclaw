@@ -41,6 +41,7 @@ type AgentLoop struct {
 	summarizing     sync.Map
 	fallback        *providers.FallbackChain
 	channelManager  *channels.Manager
+	memoryMCP       *mcpTurnMemoryClient
 }
 
 const promptLengthControlHint = "Length control: keep output concise, prefer summaries over raw long logs/HTML, and avoid unnecessary long excerpts."
@@ -87,6 +88,7 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 		taskMaxParallel: cfg.Agents.Defaults.TaskMaxParallel,
 		summarizing:     sync.Map{},
 		fallback:        fallbackChain,
+		memoryMCP:       newMCPMemoryClientFromRemote(cfg.Tools.MCP.Remote),
 	}
 }
 
@@ -626,6 +628,25 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 		opts.ChatID,
 	)
 
+	var memoryTurn *memoryTurnContext
+	if al.memoryMCP != nil {
+		memoryUserID := strings.TrimSpace(opts.ChatID)
+		if memoryUserID == "" {
+			memoryUserID = "unknown"
+		}
+		turn, recallText, memErr := al.memoryMCP.beforeTurn(ctx, opts.SessionKey, memoryUserID, opts.UserMessage)
+		if memErr != nil {
+			logger.WarnCF("agent", "memory_before_turn call failed", map[string]any{
+				"agent_id":    agent.ID,
+				"session_key": opts.SessionKey,
+				"error":       memErr.Error(),
+			})
+		} else {
+			memoryTurn = turn
+			messages = injectMCPMemoryRecall(messages, recallText)
+		}
+	}
+
 	// 4. Save user message to session
 	agent.Sessions.AddMessage(opts.SessionKey, "user", opts.UserMessage)
 
@@ -669,6 +690,20 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	agent.Sessions.AddMessage(opts.SessionKey, "assistant", finalContent)
 	agent.Sessions.Save(opts.SessionKey)
 
+	if memoryTurn != nil {
+		memoryUserID := strings.TrimSpace(opts.ChatID)
+		if memoryUserID == "" {
+			memoryUserID = "unknown"
+		}
+		if memErr := al.memoryMCP.afterTurn(ctx, opts.SessionKey, memoryUserID, finalContent, memoryTurn); memErr != nil {
+			logger.WarnCF("agent", "memory_after_turn call failed", map[string]any{
+				"agent_id":    agent.ID,
+				"session_key": opts.SessionKey,
+				"error":       memErr.Error(),
+			})
+		}
+	}
+
 	// 8. Optional: summarization
 	if opts.EnableSummary {
 		al.maybeSummarize(agent, opts.SessionKey, opts.Channel, opts.ChatID)
@@ -694,6 +729,26 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 		})
 
 	return finalContent, nil
+}
+
+// injectMCPMemoryRecall appends memory recall text into the first system message.
+// The messages parameter is provider message list and recallText is the non-empty recalled memory excerpt.
+// It returns the updated message slice and preserves all non-system messages.
+func injectMCPMemoryRecall(messages []providers.Message, recallText string) []providers.Message {
+	trimmedRecall := strings.TrimSpace(recallText)
+	if len(messages) == 0 || trimmedRecall == "" {
+		return messages
+	}
+
+	for idx := range messages {
+		if messages[idx].Role != "system" {
+			continue
+		}
+		messages[idx].Content = strings.TrimSpace(messages[idx].Content) + "\n\n---\n\n## MCP Memory Recall\n" + trimmedRecall
+		return messages
+	}
+
+	return messages
 }
 
 // runLLMIteration executes the LLM call loop with tool handling.
