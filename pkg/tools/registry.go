@@ -28,6 +28,19 @@ func (r *ToolRegistry) Register(tool Tool) {
 	r.tools[tool.Name()] = tool
 }
 
+// Unregister removes a tool from the registry by name.
+// The name parameter identifies the target tool.
+// It returns true when a tool existed and was removed.
+func (r *ToolRegistry) Unregister(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.tools[name]; !ok {
+		return false
+	}
+	delete(r.tools, name)
+	return true
+}
+
 func (r *ToolRegistry) Get(name string) (Tool, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

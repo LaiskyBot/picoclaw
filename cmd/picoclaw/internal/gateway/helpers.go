@@ -50,6 +50,13 @@ func gatewayCmd(debug bool) error {
 
 	msgBus := bus.NewMessageBus()
 	agentLoop := agent.NewAgentLoop(cfg, msgBus, provider)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	initialRefreshCtx, initialRefreshCancel := context.WithTimeout(ctx, 30*time.Second)
+	agentLoop.RefreshRemoteMCPTools(initialRefreshCtx)
+	initialRefreshCancel()
+	agentLoop.StartRemoteMCPToolsRefresher(ctx, 5*time.Minute)
 
 	// Print agent startup info
 	fmt.Println("\n📦 Agent Status:")
@@ -158,9 +165,6 @@ func gatewayCmd(debug bool) error {
 
 	fmt.Printf("✓ Gateway started on %s:%d\n", cfg.Gateway.Host, cfg.Gateway.Port)
 	fmt.Println("Press Ctrl+C to stop")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	if err := cronService.Start(); err != nil {
 		fmt.Printf("Error starting cron service: %v\n", err)

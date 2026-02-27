@@ -133,6 +133,8 @@ func TestRemoteMCPToolListAndCall(t *testing.T) {
 			require.Equal(t, "session-1", r.Header.Get("Mcp-Session-Id"))
 			params, _ := req["params"].(map[string]any)
 			require.Equal(t, "echo", params["name"])
+			callArgs, _ := params["arguments"].(map[string]any)
+			require.Equal(t, "hello", callArgs["message"])
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"jsonrpc": "2.0",
 				"id":      req["id"],
@@ -173,4 +175,112 @@ func TestRemoteMCPToolListAndCall(t *testing.T) {
 	})
 	require.False(t, callResult.IsError)
 	require.Contains(t, callResult.ForUser, "ok")
+}
+
+// TestRemoteMCPToolDiscoverConfiguredTools verifies discovery output from configured servers.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestRemoteMCPToolDiscoverConfiguredTools(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		var req map[string]any
+		err := json.NewDecoder(r.Body).Decode(&req)
+		require.NoError(t, err)
+
+		method, _ := req["method"].(string)
+		switch method {
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", "session-discovery")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req["id"],
+				"result":  map[string]any{"protocolVersion": "2024-11-05"},
+			})
+		case "tools/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req["id"],
+				"result": map[string]any{
+					"tools": []map[string]any{{
+						"name":        "file_write",
+						"description": "Write file",
+						"inputSchema": map[string]any{"type": "object"},
+					}},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	tool := NewRemoteMCPTool(t.TempDir())
+	bootErr := tool.BootstrapConfiguredServers([]ConfiguredRemoteMCPServer{{
+		Name: "laisky",
+		Type: "http",
+		URL:  server.URL,
+	}})
+	require.NoError(t, bootErr)
+
+	discovered, discoverErr := tool.DiscoverConfiguredTools(context.Background())
+	require.NoError(t, discoverErr)
+	require.Len(t, discovered, 1)
+	require.Equal(t, "laisky", discovered[0].ServerName)
+	require.Equal(t, "file_write", discovered[0].Name)
+}
+
+// TestRemoteMCPProxyToolExecute verifies proxy tool forwards calls to configured remote server.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestRemoteMCPProxyToolExecute(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		var req map[string]any
+		err := json.NewDecoder(r.Body).Decode(&req)
+		require.NoError(t, err)
+
+		method, _ := req["method"].(string)
+		switch method {
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", "session-proxy")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req["id"],
+				"result":  map[string]any{"protocolVersion": "2024-11-05"},
+			})
+		case "tools/call":
+			params, _ := req["params"].(map[string]any)
+			callArgs, _ := params["arguments"].(map[string]any)
+			require.Equal(t, "default", callArgs["project"])
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req["id"],
+				"result":  map[string]any{"ok": true},
+			})
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	remote := NewRemoteMCPTool(t.TempDir())
+	bootErr := remote.BootstrapConfiguredServers([]ConfiguredRemoteMCPServer{{
+		Name: "laisky",
+		Type: "http",
+		URL:  server.URL,
+	}})
+	require.NoError(t, bootErr)
+
+	proxy := NewRemoteMCPProxyTool("file_write", RemoteMCPDiscoveredTool{
+		ServerName:  "laisky",
+		Name:        "file_write",
+		Description: "Write file",
+		InputSchema: map[string]any{"type": "object"},
+	}, remote)
+
+	result := proxy.Execute(context.Background(), map[string]any{"project": "default"})
+	require.False(t, result.IsError)
+	require.Contains(t, result.ForUser, "\"ok\": true")
 }

@@ -104,6 +104,33 @@ func TestToolRegistry_RegisterOverwrite(t *testing.T) {
 	}
 }
 
+func TestToolRegistry_Unregister(t *testing.T) {
+	r := NewToolRegistry()
+	r.Register(newMockTool("dup", "first"))
+	r.Register(newMockTool("another", "second"))
+
+	removed := r.Unregister("dup")
+	if !removed {
+		t.Fatal("expected unregister to return true for existing tool")
+	}
+
+	if r.Count() != 1 {
+		t.Errorf("expected count 1 after unregister, got %d", r.Count())
+	}
+
+	if _, ok := r.Get("dup"); ok {
+		t.Fatal("expected tool 'dup' to be removed")
+	}
+}
+
+func TestToolRegistry_UnregisterMissing(t *testing.T) {
+	r := NewToolRegistry()
+	removed := r.Unregister("missing")
+	if removed {
+		t.Fatal("expected unregister false for missing tool")
+	}
+}
+
 func TestToolRegistry_Execute_Success(t *testing.T) {
 	r := NewToolRegistry()
 	r.Register(&mockRegistryTool{

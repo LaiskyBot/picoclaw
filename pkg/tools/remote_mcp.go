@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sipeed/picoclaw/pkg/logger"
 )
 
 const (
@@ -54,6 +56,16 @@ type ConfiguredRemoteMCPServer struct {
 	Type    string
 	URL     string
 	Headers map[string]string
+}
+
+// RemoteMCPDiscoveredTool represents one tool discovered from configured remote MCP servers.
+// ServerName identifies source server, Name is remote tool name, Description is optional,
+// and InputSchema carries JSON schema for tool parameters.
+type RemoteMCPDiscoveredTool struct {
+	ServerName  string
+	Name        string
+	Description string
+	InputSchema map[string]any
 }
 
 // remoteMCPRequest represents a JSON-RPC request to an MCP endpoint.
@@ -350,6 +362,12 @@ func (t *RemoteMCPTool) executeCallTool(ctx context.Context, args map[string]any
 	if rawArgs, ok := args["arguments"].(map[string]any); ok && rawArgs != nil {
 		arguments = rawArgs
 	}
+
+	logger.DebugCF("tool", "remote_mcp call_tool prepared arguments", map[string]any{
+		"server":        server.Name,
+		"tool_name":     toolName,
+		"argument_keys": len(arguments),
+	})
 
 	initSessionID, err := t.initializeServer(ctx, server)
 	if err != nil {

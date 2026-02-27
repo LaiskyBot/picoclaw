@@ -49,6 +49,67 @@ func TestBuildConfiguredRemoteMCPServers(t *testing.T) {
 	require.Equal(t, "Bearer token", servers[0].Headers["Authorization"])
 }
 
+// TestBuildDesiredRemoteProxyNames verifies proxy naming rules for unique and duplicated remote tools.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestBuildDesiredRemoteProxyNames(t *testing.T) {
+	desired := buildDesiredRemoteProxyNames([]tools.RemoteMCPDiscoveredTool{
+		{ServerName: "alpha", Name: "file_write"},
+		{ServerName: "beta", Name: "file_write"},
+		{ServerName: "alpha", Name: "read_file"},
+	})
+
+	require.Contains(t, desired, "alpha__file_write")
+	require.Contains(t, desired, "beta__file_write")
+	require.Contains(t, desired, "read_file")
+}
+
+// TestApplyRemoteMCPToolsToRegistry verifies dynamic remote tools are registered and stale tools are removed.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestApplyRemoteMCPToolsToRegistry(t *testing.T) {
+	registry := tools.NewToolRegistry()
+	remoteClient := tools.NewRemoteMCPTool(t.TempDir())
+	injectedStore := map[string]map[string]struct{}{}
+
+	applyRemoteMCPToolsToRegistry("main", registry, remoteClient, []tools.RemoteMCPDiscoveredTool{{
+		ServerName:  "alpha",
+		Name:        "file_write",
+		Description: "write file",
+		InputSchema: map[string]any{"type": "object"},
+	}}, injectedStore)
+
+	_, exists := registry.Get("file_write")
+	require.True(t, exists)
+
+	applyRemoteMCPToolsToRegistry("main", registry, remoteClient, nil, injectedStore)
+	_, exists = registry.Get("file_write")
+	require.False(t, exists)
+}
+
+// TestApplyRemoteMCPToolsToRegistrySkipsCollisions verifies collisions do not override local tools.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestApplyRemoteMCPToolsToRegistrySkipsCollisions(t *testing.T) {
+	registry := tools.NewToolRegistry()
+	registry.Register(&mockCustomTool{})
+
+	remoteClient := tools.NewRemoteMCPTool(t.TempDir())
+	injectedStore := map[string]map[string]struct{}{}
+
+	applyRemoteMCPToolsToRegistry("main", registry, remoteClient, []tools.RemoteMCPDiscoveredTool{{
+		ServerName:  "alpha",
+		Name:        "mock_custom",
+		Description: "collision",
+		InputSchema: map[string]any{"type": "object"},
+	}}, injectedStore)
+
+	toolObj, exists := registry.Get("mock_custom")
+	require.True(t, exists)
+	_, isProxy := toolObj.(*tools.RemoteMCPProxyTool)
+	require.False(t, isProxy)
+}
+
 // TestRunAgentLoop_UsesMCPMemoryLifecycle verifies laisky MCP memory hooks run before/after model turns.
 // It configures mcp.laisky.com, injects mock MCP responses, and ensures recall is appended while file memory is disabled.
 // It returns no value and fails when before/after lifecycle behavior is incorrect.

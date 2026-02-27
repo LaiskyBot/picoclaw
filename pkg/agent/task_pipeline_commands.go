@@ -22,7 +22,7 @@ func buildPlannerDelegationPrompt(task *PipelineTask) string {
 	sb.WriteString("Use tools to complete the task end-to-end. Delegate worker subagents only when the task is long-running or parallelizable.\n")
 	sb.WriteString("When multiple independent data-gathering actions are needed, issue parallel tool calls in the same turn to reduce round trips.\n")
 	sb.WriteString("For Skills workflows, prefer find_skills then install_skill, then read the installed SKILL.md and execute steps.\n")
-	sb.WriteString("For MCP workflows, distinguish local vs remote MCP. Local MCP is configured under tools.mcp.local, and remote MCP is configured/managed under tools.mcp.remote and via remote_mcp operations.\n")
+	sb.WriteString("For MCP workflows, use available MCP tools directly as regular tools in this session.\n")
 	sb.WriteString("When generating images/files, deliver them via the message tool using attachments (photo/document with path/url/file_id).\n")
 	sb.WriteString("Never claim media was sent unless the message tool call already succeeded in this run.\n")
 	sb.WriteString("Do not output placeholders such as [Sending image] without a successful attachment send.\n")

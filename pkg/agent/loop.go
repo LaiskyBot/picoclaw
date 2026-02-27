@@ -42,6 +42,9 @@ type AgentLoop struct {
 	fallback           *providers.FallbackChain
 	channelManager     *channels.Manager
 	memoryMCP          *mcpTurnMemoryClient
+	remoteMCPByAgent   map[string]*tools.RemoteMCPTool
+	remoteInjected     map[string]map[string]struct{}
+	remoteToolsMu      sync.Mutex
 }
 
 const promptLengthControlHint = "Length control: keep output concise, prefer summaries over raw long logs/HTML, and avoid unnecessary long excerpts."
@@ -67,7 +70,7 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 	registry := NewAgentRegistry(cfg, provider)
 
 	// Register shared tools to all agents
-	registerSharedTools(cfg, msgBus, registry, provider)
+	remoteMCPByAgent := registerSharedTools(cfg, msgBus, registry, provider)
 
 	// Set up shared fallback chain
 	cooldown := providers.NewCooldownTracker()
@@ -93,6 +96,8 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 		summarizing:        sync.Map{},
 		fallback:           fallbackChain,
 		memoryMCP:          newMCPMemoryClientFromRemote(cfg.Tools.MCP.Remote),
+		remoteMCPByAgent:   remoteMCPByAgent,
+		remoteInjected:     map[string]map[string]struct{}{},
 	}
 }
 
@@ -102,7 +107,9 @@ func registerSharedTools(
 	msgBus *bus.MessageBus,
 	registry *AgentRegistry,
 	provider providers.LLMProvider,
-) {
+) map[string]*tools.RemoteMCPTool {
+	remoteMCPByAgent := make(map[string]*tools.RemoteMCPTool)
+
 	for _, agentID := range registry.ListAgentIDs() {
 		agent, ok := registry.GetAgent(agentID)
 		if !ok {
@@ -156,7 +163,7 @@ func registerSharedTools(
 		if err := remoteMCPTool.BootstrapConfiguredServers(buildConfiguredRemoteMCPServers(cfg.Tools.MCP.Remote)); err != nil {
 			logger.WarnC("agent", fmt.Sprintf("failed to bootstrap configured remote MCP servers for agent %q: %v", agentID, err))
 		}
-		agent.Tools.Register(remoteMCPTool)
+		remoteMCPByAgent[agentID] = remoteMCPTool
 
 		// Spawn tool with allowlist checker
 		subagentManager := tools.NewSubagentManager(provider, agent.Model, agent.Workspace, msgBus)
@@ -168,6 +175,178 @@ func registerSharedTools(
 		})
 		agent.Tools.Register(spawnTool)
 	}
+
+	return remoteMCPByAgent
+}
+
+// RefreshRemoteMCPTools refreshes discovered remote MCP tools and injects them as normal tools.
+// The ctx parameter controls remote calls and this method keeps tool registration deterministic.
+func (al *AgentLoop) RefreshRemoteMCPTools(ctx context.Context) {
+	al.remoteToolsMu.Lock()
+	defer al.remoteToolsMu.Unlock()
+
+	for _, agentID := range al.registry.ListAgentIDs() {
+		remoteClient, ok := al.remoteMCPByAgent[agentID]
+		if !ok || remoteClient == nil {
+			continue
+		}
+
+		agentInstance, ok := al.registry.GetAgent(agentID)
+		if !ok || agentInstance == nil {
+			continue
+		}
+
+		discovered, err := remoteClient.DiscoverConfiguredTools(ctx)
+		if err != nil {
+			logger.DebugCF("agent", "Failed to refresh remote MCP tools", map[string]any{
+				"agent_id": agentID,
+				"error":    err.Error(),
+			})
+			continue
+		}
+
+		applyRemoteMCPToolsToRegistry(agentID, agentInstance.Tools, remoteClient, discovered, al.remoteInjected)
+	}
+}
+
+// StartRemoteMCPToolsRefresher starts periodic remote MCP tool discovery in background.
+// The ctx parameter controls lifecycle and interval defines refresh cadence.
+func (al *AgentLoop) StartRemoteMCPToolsRefresher(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				al.RefreshRemoteMCPTools(refreshCtx)
+				cancel()
+			}
+		}
+	}()
+}
+
+// applyRemoteMCPToolsToRegistry synchronizes discovered remote MCP tools into local registry.
+// The agentID identifies target registry and injectedStore tracks previously injected tool names.
+func applyRemoteMCPToolsToRegistry(
+	agentID string,
+	registry *tools.ToolRegistry,
+	remoteClient *tools.RemoteMCPTool,
+	discovered []tools.RemoteMCPDiscoveredTool,
+	injectedStore map[string]map[string]struct{},
+) {
+	if registry == nil || remoteClient == nil {
+		return
+	}
+
+	desired := buildDesiredRemoteProxyNames(discovered)
+	previous := injectedStore[agentID]
+	if previous == nil {
+		previous = map[string]struct{}{}
+	}
+
+	newInjected := make(map[string]struct{}, len(desired))
+	for proxyName, item := range desired {
+		if _, wasInjected := previous[proxyName]; !wasInjected {
+			if existing, exists := registry.Get(proxyName); exists {
+				if _, isRemoteProxy := existing.(*tools.RemoteMCPProxyTool); !isRemoteProxy {
+					logger.DebugCF("agent", "Skip remote MCP tool due to name collision", map[string]any{
+						"agent_id":   agentID,
+						"tool_name":  proxyName,
+						"server_name": item.ServerName,
+					})
+					continue
+				}
+			}
+		}
+
+		registry.Register(tools.NewRemoteMCPProxyTool(proxyName, item, remoteClient))
+		newInjected[proxyName] = struct{}{}
+	}
+
+	for previousName := range previous {
+		if _, ok := newInjected[previousName]; ok {
+			continue
+		}
+		registry.Unregister(previousName)
+	}
+
+	injectedStore[agentID] = newInjected
+
+	logger.DebugCF("agent", "Refreshed remote MCP tools", map[string]any{
+		"agent_id":      agentID,
+		"discovered":    len(discovered),
+		"injected_count": len(newInjected),
+	})
+}
+
+// buildDesiredRemoteProxyNames computes stable proxy names for discovered tools.
+// The discovered parameter is a flat list from all servers and return value maps proxy name to source metadata.
+func buildDesiredRemoteProxyNames(discovered []tools.RemoteMCPDiscoveredTool) map[string]tools.RemoteMCPDiscoveredTool {
+	if len(discovered) == 0 {
+		return map[string]tools.RemoteMCPDiscoveredTool{}
+	}
+
+	nameCount := make(map[string]int, len(discovered))
+	for _, item := range discovered {
+		base := strings.TrimSpace(item.Name)
+		if base == "" {
+			continue
+		}
+		nameCount[base]++
+	}
+
+	result := make(map[string]tools.RemoteMCPDiscoveredTool, len(discovered))
+	for _, item := range discovered {
+		base := sanitizeDynamicToolName(item.Name)
+		if base == "" {
+			continue
+		}
+
+		proxyName := base
+		if nameCount[item.Name] > 1 {
+			proxyName = sanitizeDynamicToolName(item.ServerName) + "__" + base
+		}
+
+		result[proxyName] = item
+	}
+
+	return result
+}
+
+// sanitizeDynamicToolName normalizes dynamic tool names to provider-safe format.
+// The raw parameter is arbitrary remote metadata and return value keeps letters, digits, '-', '_' and '.'.
+func sanitizeDynamicToolName(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.Grow(len(trimmed))
+	for _, r := range trimmed {
+		switch {
+		case r >= 'a' && r <= 'z':
+			sb.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			sb.WriteRune(r)
+		case r >= '0' && r <= '9':
+			sb.WriteRune(r)
+		case r == '-', r == '_', r == '.':
+			sb.WriteRune(r)
+		default:
+			sb.WriteRune('_')
+		}
+	}
+
+	return strings.Trim(sb.String(), "_")
 }
 
 // buildConfiguredRemoteMCPServers converts config remote MCP map into deterministic tool bootstrap inputs.

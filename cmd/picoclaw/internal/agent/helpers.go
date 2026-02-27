@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/chzyer/readline"
 
@@ -49,6 +50,9 @@ func agentCmd(message, sessionKey, model string, debug bool) error {
 
 	msgBus := bus.NewMessageBus()
 	agentLoop := agent.NewAgentLoop(cfg, msgBus, provider)
+	refreshCtx, refreshCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	agentLoop.RefreshRemoteMCPTools(refreshCtx)
+	refreshCancel()
 
 	// Print agent startup info (only for interactive mode)
 	startupInfo := agentLoop.GetStartupInfo()
