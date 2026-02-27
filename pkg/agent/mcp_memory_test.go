@@ -1,6 +1,10 @@
 package agent
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/sipeed/picoclaw/pkg/config"
@@ -20,10 +24,86 @@ func TestHasLaiskyMemoryMCPRemote(t *testing.T) {
 			Type: "http",
 			URL:  "https://mcp.laisky.com",
 		},
+		"laisky-auth": {
+			Type: "http",
+			URL:  "https://mcp.laisky.com",
+			Headers: map[string]string{
+				"Authorization": "Bearer token",
+			},
+		},
 	}
 
 	require.True(t, hasLaiskyMemoryMCPRemote(remote))
+	require.True(t, hasLaiskyMemoryMCPRemote(map[string]config.RemoteMCPServerConfig{"laisky": remote["laisky"]}))
 	require.False(t, hasLaiskyMemoryMCPRemote(map[string]config.RemoteMCPServerConfig{"other": remote["other"]}))
+}
+
+// TestPickLaiskyMemoryMCPRemoteDeterministicByName verifies remote selection is deterministic by sorted map key.
+// The t parameter controls test lifecycle and the function returns no value.
+func TestPickLaiskyMemoryMCPRemoteDeterministicByName(t *testing.T) {
+	remote := map[string]config.RemoteMCPServerConfig{
+		"b-with-auth": {
+			Type: "http",
+			URL:  "https://mcp.laisky.com",
+			Headers: map[string]string{
+				"Authorization": "Bearer token",
+			},
+		},
+		"a-without-auth": {
+			Type: "http",
+			URL:  "https://mcp.laisky.com",
+		},
+	}
+
+	name, selected, ok := pickLaiskyMemoryMCPRemote(remote)
+	require.True(t, ok)
+	require.Equal(t, "a-without-auth", name)
+	require.Equal(t, "https://mcp.laisky.com", selected.URL)
+}
+
+// TestMCPMemoryClientCallJSONRPCWithSessionSendsAuthorization verifies memory client forwards configured Authorization header.
+// The t parameter controls test lifecycle and the function returns no value.
+func TestMCPMemoryClientCallJSONRPCWithSessionSendsAuthorization(t *testing.T) {
+	const expectedAuthorization = "Bearer test-key"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		require.Equal(t, expectedAuthorization, r.Header.Get("Authorization"))
+
+		var req map[string]any
+		err := json.NewDecoder(r.Body).Decode(&req)
+		require.NoError(t, err)
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req["id"],
+			"result":  map[string]any{"ok": true},
+		})
+	}))
+	defer server.Close()
+
+	client := &mcpTurnMemoryClient{
+		endpoint: server.URL,
+		headers: map[string]string{
+			"Authorization": expectedAuthorization,
+		},
+		client: server.Client(),
+	}
+
+	result, _, err := client.callJSONRPCWithSession(context.Background(), "", "initialize", map[string]any{})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+}
+
+// TestHasAuthorizationHeader verifies case-insensitive Authorization detection with non-empty values.
+// The t parameter controls test lifecycle and the function returns no value.
+func TestHasAuthorizationHeader(t *testing.T) {
+	require.True(t, hasAuthorizationHeader(map[string]string{"Authorization": "Bearer token"}))
+	require.True(t, hasAuthorizationHeader(map[string]string{"authorization": "  Bearer token  "}))
+	require.False(t, hasAuthorizationHeader(map[string]string{"Authorization": "   "}))
+	require.False(t, hasAuthorizationHeader(map[string]string{"X-Token": "abc"}))
 }
 
 // TestExtractRecallText verifies only non-duplicate non-user recall text is injected.

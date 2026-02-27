@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -103,15 +104,15 @@ type memoryToolError struct {
 // hasLaiskyMemoryMCPRemote checks whether config contains a remote MCP entry targeting mcp.laisky.com.
 // The remote parameter is the configured tools.mcp.remote map and return value is true when enabled.
 func hasLaiskyMemoryMCPRemote(remote map[string]config.RemoteMCPServerConfig) bool {
-	_, ok := pickLaiskyMemoryMCPRemote(remote)
+	_, _, ok := pickLaiskyMemoryMCPRemote(remote)
 	return ok
 }
 
 // pickLaiskyMemoryMCPRemote selects a deterministic mcp.laisky.com remote MCP config if present.
 // The remote parameter is the configured tools.mcp.remote map and return values are chosen config and found flag.
-func pickLaiskyMemoryMCPRemote(remote map[string]config.RemoteMCPServerConfig) (config.RemoteMCPServerConfig, bool) {
+func pickLaiskyMemoryMCPRemote(remote map[string]config.RemoteMCPServerConfig) (string, config.RemoteMCPServerConfig, bool) {
 	if len(remote) == 0 {
-		return config.RemoteMCPServerConfig{}, false
+		return "", config.RemoteMCPServerConfig{}, false
 	}
 
 	names := make([]string, 0, len(remote))
@@ -126,25 +127,53 @@ func pickLaiskyMemoryMCPRemote(remote map[string]config.RemoteMCPServerConfig) (
 		if err != nil {
 			continue
 		}
-		if strings.EqualFold(parsed.Hostname(), memoryMCPHost) {
-			return entry, true
+		if !strings.EqualFold(parsed.Hostname(), memoryMCPHost) {
+			continue
 		}
+		return name, entry, true
 	}
 
-	return config.RemoteMCPServerConfig{}, false
+	return "", config.RemoteMCPServerConfig{}, false
 }
 
 // newMCPMemoryClientFromRemote constructs a turn-memory client from remote MCP config.
 // The remote parameter is tools.mcp.remote and return value is nil when laisky memory MCP is not configured.
 func newMCPMemoryClientFromRemote(remote map[string]config.RemoteMCPServerConfig) *mcpTurnMemoryClient {
-	entry, ok := pickLaiskyMemoryMCPRemote(remote)
+	name, entry, ok := pickLaiskyMemoryMCPRemote(remote)
 	if !ok {
+		logger.DebugCF("agent", "MCP memory client disabled: no mcp.laisky.com remote configured", map[string]any{
+			"remote_entries": len(remote),
+			"required_host":  memoryMCPHost,
+		})
 		return nil
 	}
 
+	headers := cloneStringMap(entry.Headers)
+	for key, value := range headers {
+		headerKey := strings.TrimSpace(key)
+		if headerKey == "" {
+			delete(headers, key)
+			continue
+		}
+		if headerKey != key {
+			delete(headers, key)
+		}
+		headers[headerKey] = strings.TrimSpace(value)
+	}
+
+	logger.DebugCF("agent", "Initialized MCP memory client from remote config", map[string]any{
+		"remote_name":        name,
+		"endpoint":           strings.TrimSpace(entry.URL),
+		"header_count":       len(headers),
+		"has_authorization":  hasAuthorizationHeader(headers),
+		"memory_project":     memoryMCPProjectID,
+		"memory_before_tool": memoryBeforeToolName,
+		"memory_after_tool":  memoryAfterToolName,
+	})
+
 	return &mcpTurnMemoryClient{
 		endpoint: strings.TrimSpace(entry.URL),
-		headers:  cloneStringMap(entry.Headers),
+		headers:  headers,
 		client: &http.Client{
 			Timeout: memoryMCPRequestTimeout,
 		},
@@ -354,6 +383,17 @@ func (c *mcpTurnMemoryClient) callJSONRPCWithSession(ctx context.Context, sessio
 		req.Header.Set(headerKey, strings.TrimSpace(value))
 	}
 
+	logger.DebugCF("agent", "Sending MCP memory JSON-RPC request", map[string]any{
+		"method":             method,
+		"endpoint":           c.endpoint,
+		"request_id":         requestID,
+		"has_session_id":     strings.TrimSpace(sessionID) != "",
+		"header_count":       len(c.headers),
+		"has_authorization":  hasAuthorizationHeader(c.headers),
+		"memory_before_tool": memoryBeforeToolName,
+		"memory_after_tool":  memoryAfterToolName,
+	})
+
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("send json-rpc request: %w", err)
@@ -361,7 +401,19 @@ func (c *mcpTurnMemoryClient) callJSONRPCWithSession(ctx context.Context, sessio
 	defer resp.Body.Close()
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, "", fmt.Errorf("mcp http status %d", resp.StatusCode)
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		bodyPreview := strings.TrimSpace(string(bodyBytes))
+		if len(bodyPreview) > 512 {
+			bodyPreview = bodyPreview[:512]
+		}
+		logger.DebugCF("agent", "MCP memory HTTP error response", map[string]any{
+			"method":            method,
+			"endpoint":          c.endpoint,
+			"status_code":       resp.StatusCode,
+			"has_authorization": hasAuthorizationHeader(c.headers),
+			"response_preview":  bodyPreview,
+		})
+		return nil, "", fmt.Errorf("mcp http status %d: %s", resp.StatusCode, bodyPreview)
 	}
 
 	var envelope memoryRPCEnvelope
@@ -369,6 +421,13 @@ func (c *mcpTurnMemoryClient) callJSONRPCWithSession(ctx context.Context, sessio
 		return nil, "", fmt.Errorf("decode json-rpc response: %w", err)
 	}
 	if envelope.Error != nil {
+		logger.DebugCF("agent", "MCP memory JSON-RPC error response", map[string]any{
+			"method":            method,
+			"endpoint":          c.endpoint,
+			"rpc_code":          envelope.Error.Code,
+			"rpc_message":       envelope.Error.Message,
+			"has_authorization": hasAuthorizationHeader(c.headers),
+		})
 		return nil, "", fmt.Errorf("mcp rpc error %d: %s", envelope.Error.Code, envelope.Error.Message)
 	}
 
@@ -539,4 +598,16 @@ func cloneStringMap(in map[string]string) map[string]string {
 		out[key] = value
 	}
 	return out
+}
+
+// hasAuthorizationHeader checks whether headers include a non-empty Authorization value.
+// The headers parameter is an HTTP header map and return value is true when auth is configured.
+func hasAuthorizationHeader(headers map[string]string) bool {
+	for key, value := range headers {
+		if strings.EqualFold(strings.TrimSpace(key), "authorization") && strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+
+	return false
 }

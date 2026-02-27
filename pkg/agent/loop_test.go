@@ -252,6 +252,9 @@ func TestRunAgentLoop_MemoryLifecycleUsesToolChatID(t *testing.T) {
 		"laisky": {
 			Type: "http",
 			URL:  "https://mcp.laisky.com",
+			Headers: map[string]string{
+				"Authorization": "Bearer test-token",
+			},
 		},
 	}
 
@@ -345,6 +348,9 @@ func TestRunAgentLoop_MemoryBeforeTurnFailureKeepsRecentHistoryMessages(t *testi
 		"laisky": {
 			Type: "http",
 			URL:  "https://mcp.laisky.com",
+			Headers: map[string]string{
+				"Authorization": "Bearer test-token",
+			},
 		},
 	}
 
