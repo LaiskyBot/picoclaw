@@ -170,6 +170,202 @@ func TestRunAgentLoop_UsesMCPMemoryLifecycle(t *testing.T) {
 	require.Equal(t, "session-1", capturedAfterArgs["session_id"])
 }
 
+// TestRunAgentLoop_MemoryLifecycleUsesToolChatID verifies memory user scope uses stable ToolChatID in delegated planner runs.
+// The t parameter controls assertions and returns no value.
+func TestRunAgentLoop_MemoryLifecycleUsesToolChatID(t *testing.T) {
+	tmpDir := t.TempDir()
+	var mu sync.Mutex
+	var capturedBeforeArgs map[string]any
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		var req map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+
+		method, _ := req["method"].(string)
+		switch method {
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", "memory-session-2")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req["id"],
+				"result":  map[string]any{"protocolVersion": "2024-11-05"},
+			})
+		case "tools/call":
+			params, _ := req["params"].(map[string]any)
+			name, _ := params["name"].(string)
+			arguments, _ := params["arguments"].(map[string]any)
+
+			switch name {
+			case memoryBeforeToolName:
+				mu.Lock()
+				capturedBeforeArgs = arguments
+				mu.Unlock()
+
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req["id"],
+					"result": map[string]any{
+						"content": []map[string]any{{
+							"type": "text",
+							"text": `{"input_items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`,
+						}},
+					},
+				})
+			case memoryAfterToolName:
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req["id"],
+					"result": map[string]any{
+						"content": []map[string]any{{
+							"type": "text",
+							"text": `{"ok":true}`,
+						}},
+					},
+				})
+			default:
+				w.WriteHeader(http.StatusBadRequest)
+			}
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	provider := &recordingMockProvider{response: "ok"}
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = tmpDir
+	cfg.Agents.Defaults.Model = "test-model"
+	cfg.Tools.MCP.Remote = map[string]config.RemoteMCPServerConfig{
+		"laisky": {
+			Type: "http",
+			URL:  "https://mcp.laisky.com",
+		},
+	}
+
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), provider)
+	require.NotNil(t, al.memoryMCP)
+	al.memoryMCP.endpoint = server.URL
+
+	defaultAgent := al.registry.GetDefaultAgent()
+	require.NotNil(t, defaultAgent)
+
+	_, err := al.runAgentLoop(context.Background(), defaultAgent, processOptions{
+		SessionKey:      "agent:main:pipeline:task-2026-02-26-1234",
+		Channel:         plannerTaskChannel,
+		ChatID:          "task-2026-02-26-1234",
+		ToolChannel:     "telegram",
+		ToolChatID:      "telegram-chat-42",
+		UserMessage:     "hello",
+		DefaultResponse: "empty",
+		EnableSummary:   false,
+		SendResponse:    false,
+		NoHistory:       true,
+	})
+	require.NoError(t, err)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotNil(t, capturedBeforeArgs)
+	require.Equal(t, "telegram-chat-42", capturedBeforeArgs["user_id"])
+}
+
+// TestRunAgentLoop_MemoryBeforeTurnFailureInjectsLocalFallback verifies local recent context is injected when remote memory recall fails.
+// The t parameter controls assertions and returns no value.
+func TestRunAgentLoop_MemoryBeforeTurnFailureInjectsLocalFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		var req map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		method, _ := req["method"].(string)
+
+		switch method {
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", "memory-session-3")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req["id"],
+				"result":  map[string]any{"protocolVersion": "2024-11-05"},
+			})
+		case "tools/call":
+			params, _ := req["params"].(map[string]any)
+			name, _ := params["name"].(string)
+			if name == memoryBeforeToolName {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req["id"],
+					"result": map[string]any{
+						"isError": true,
+						"error": map[string]any{
+							"code":      "internal_error",
+							"message":   "simulated failure",
+							"retryable": false,
+						},
+					},
+				})
+				return
+			}
+
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req["id"],
+				"result": map[string]any{
+					"content": []map[string]any{{
+						"type": "text",
+						"text": `{"ok":true}`,
+					}},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	provider := &recordingMockProvider{response: "ok"}
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = tmpDir
+	cfg.Agents.Defaults.Model = "test-model"
+	cfg.Tools.MCP.Remote = map[string]config.RemoteMCPServerConfig{
+		"laisky": {
+			Type: "http",
+			URL:  "https://mcp.laisky.com",
+		},
+	}
+
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), provider)
+	require.NotNil(t, al.memoryMCP)
+	al.memoryMCP.endpoint = server.URL
+
+	defaultAgent := al.registry.GetDefaultAgent()
+	require.NotNil(t, defaultAgent)
+	sessionKey := "agent:main:direct:user-1"
+	defaultAgent.Sessions.AddMessage(sessionKey, "user", "我住在加拿大渥太华的 Barrhaven")
+	defaultAgent.Sessions.AddMessage(sessionKey, "assistant", "已记录：你住在加拿大渥太华的 Barrhaven。")
+
+	_, err := al.runAgentLoop(context.Background(), defaultAgent, processOptions{
+		SessionKey:      sessionKey,
+		Channel:         "telegram",
+		ChatID:          "chat-1",
+		UserMessage:     "附近的 costco 有卖中式料理的料酒吗",
+		DefaultResponse: "empty",
+		EnableSummary:   false,
+		SendResponse:    false,
+		NoHistory:       false,
+	})
+	require.NoError(t, err)
+
+	require.NotEmpty(t, provider.lastMessages)
+	systemPrompt := provider.lastMessages[0].Content
+	require.Contains(t, systemPrompt, "Recent Session Context")
+	require.Contains(t, systemPrompt, "Barrhaven")
+	require.Contains(t, systemPrompt, "Local Context Fallback")
+}
+
 // TestRunAgentLoop_EmptyDefaultResponseStillReturnsNonEmpty verifies global non-empty fallback when model and default output are blank.
 // The t parameter controls assertions for response fallback stability.
 // It returns no value and fails when an empty final response is returned.

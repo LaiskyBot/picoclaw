@@ -638,19 +638,29 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 		opts.Channel,
 		opts.ChatID,
 	)
+	messages = injectRecentSessionContext(messages, history)
 
 	var memoryTurn *memoryTurnContext
+	memoryUserID := resolveMemoryUserID(opts)
 	if al.memoryMCP != nil {
-		memoryUserID := strings.TrimSpace(opts.ChatID)
-		if memoryUserID == "" {
-			memoryUserID = "unknown"
-		}
+		logger.DebugCF("agent", "Preparing memory_before_turn call", map[string]any{
+			"agent_id":       agent.ID,
+			"session_key":    opts.SessionKey,
+			"memory_user_id": memoryUserID,
+			"has_tool_chat":  strings.TrimSpace(opts.ToolChatID) != "",
+		})
 		turn, recallText, memErr := al.memoryMCP.beforeTurn(ctx, opts.SessionKey, memoryUserID, opts.UserMessage)
 		if memErr != nil {
+			fallbackContext := buildRecentSessionContext(history, 6)
+			if fallbackContext != "" {
+				messages = injectMemoryFailureFallback(messages, fallbackContext)
+			}
 			logger.WarnCF("agent", "memory_before_turn call failed", map[string]any{
-				"agent_id":    agent.ID,
-				"session_key": opts.SessionKey,
-				"error":       memErr.Error(),
+				"agent_id":               agent.ID,
+				"session_key":            opts.SessionKey,
+				"memory_user_id":         memoryUserID,
+				"error":                  memErr.Error(),
+				"fallback_context_chars": len(fallbackContext),
 			})
 		} else {
 			memoryTurn = turn
@@ -722,15 +732,12 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	agent.Sessions.Save(opts.SessionKey)
 
 	if memoryTurn != nil {
-		memoryUserID := strings.TrimSpace(opts.ChatID)
-		if memoryUserID == "" {
-			memoryUserID = "unknown"
-		}
 		if memErr := al.memoryMCP.afterTurn(ctx, opts.SessionKey, memoryUserID, finalContent, memoryTurn); memErr != nil {
 			logger.WarnCF("agent", "memory_after_turn call failed", map[string]any{
-				"agent_id":    agent.ID,
-				"session_key": opts.SessionKey,
-				"error":       memErr.Error(),
+				"agent_id":       agent.ID,
+				"session_key":    opts.SessionKey,
+				"memory_user_id": memoryUserID,
+				"error":          memErr.Error(),
 			})
 		}
 	}
@@ -762,6 +769,18 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	return finalContent, nil
 }
 
+// resolveMemoryUserID returns a stable memory user scope ID for this turn.
+// The opts parameter carries runtime channel/chat overrides and return value prefers tool chat scope when available.
+func resolveMemoryUserID(opts processOptions) string {
+	if toolChatID := strings.TrimSpace(opts.ToolChatID); toolChatID != "" {
+		return toolChatID
+	}
+	if chatID := strings.TrimSpace(opts.ChatID); chatID != "" {
+		return chatID
+	}
+	return "unknown"
+}
+
 // injectMCPMemoryRecall appends memory recall text into the first system message.
 // The messages parameter is provider message list and recallText is the non-empty recalled memory excerpt.
 // It returns the updated message slice and preserves all non-system messages.
@@ -780,6 +799,50 @@ func injectMCPMemoryRecall(messages []providers.Message, recallText string) []pr
 	}
 
 	return messages
+}
+
+// injectRecentSessionContext appends compact recent session turns into the first system message.
+// The messages parameter is provider message list, history contains routed session turns, and return value preserves all non-system messages.
+func injectRecentSessionContext(messages []providers.Message, history []providers.Message) []providers.Message {
+	recent := buildRecentSessionContext(history, 6)
+	if recent == "" {
+		return messages
+	}
+
+	for idx := range messages {
+		if messages[idx].Role != "system" {
+			continue
+		}
+		messages[idx].Content = strings.TrimSpace(messages[idx].Content) + "\n\n---\n\n## Recent Session Context\n" + recent
+		return messages
+	}
+
+	return messages
+}
+
+// injectMemoryFailureFallback appends a local recent-context fallback into first system message.
+// The messages parameter is provider message list and fallback is compact local context used when remote memory lookup fails.
+func injectMemoryFailureFallback(messages []providers.Message, fallback string) []providers.Message {
+	trimmedFallback := strings.TrimSpace(fallback)
+	if len(messages) == 0 || trimmedFallback == "" {
+		return messages
+	}
+
+	for idx := range messages {
+		if messages[idx].Role != "system" {
+			continue
+		}
+		messages[idx].Content = strings.TrimSpace(messages[idx].Content) + "\n\n---\n\n## Local Context Fallback\n" + trimmedFallback
+		return messages
+	}
+
+	return messages
+}
+
+// buildRecentSessionContext renders a compact user/assistant context excerpt.
+// The history parameter is session messages and maxMessages limits number of recent entries in output.
+func buildRecentSessionContext(history []providers.Message, maxMessages int) string {
+	return formatRecentConversationHistory(history, maxMessages)
 }
 
 // runLLMIteration executes the LLM call loop with tool handling.
