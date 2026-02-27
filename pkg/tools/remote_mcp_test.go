@@ -253,7 +253,7 @@ func TestRemoteMCPProxyToolExecute(t *testing.T) {
 		case "tools/call":
 			params, _ := req["params"].(map[string]any)
 			callArgs, _ := params["arguments"].(map[string]any)
-			require.Equal(t, "default", callArgs["project"])
+			require.Equal(t, "bot", callArgs["project"])
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"jsonrpc": "2.0",
 				"id":      req["id"],
@@ -275,6 +275,61 @@ func TestRemoteMCPProxyToolExecute(t *testing.T) {
 
 	proxy := NewRemoteMCPProxyTool("file_write", RemoteMCPDiscoveredTool{
 		ServerName:  "laisky",
+		Name:        "file_write",
+		Description: "Write file",
+		InputSchema: map[string]any{"type": "object"},
+	}, remote)
+
+	result := proxy.Execute(context.Background(), map[string]any{"project": "default"})
+	require.False(t, result.IsError)
+	require.Contains(t, result.ForUser, "\"ok\": true")
+}
+
+// TestRemoteMCPProxyToolExecuteKeepsProjectForNonLaisky verifies project is not coerced for non-LAISKY servers.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestRemoteMCPProxyToolExecuteKeepsProjectForNonLaisky(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		var req map[string]any
+		err := json.NewDecoder(r.Body).Decode(&req)
+		require.NoError(t, err)
+
+		method, _ := req["method"].(string)
+		switch method {
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", "session-proxy-non-laisky")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req["id"],
+				"result":  map[string]any{"protocolVersion": "2024-11-05"},
+			})
+		case "tools/call":
+			params, _ := req["params"].(map[string]any)
+			callArgs, _ := params["arguments"].(map[string]any)
+			require.Equal(t, "default", callArgs["project"])
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req["id"],
+				"result":  map[string]any{"ok": true},
+			})
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	remote := NewRemoteMCPTool(t.TempDir())
+	bootErr := remote.BootstrapConfiguredServers([]ConfiguredRemoteMCPServer{{
+		Name: "demo",
+		Type: "http",
+		URL:  server.URL,
+	}})
+	require.NoError(t, bootErr)
+
+	proxy := NewRemoteMCPProxyTool("file_write", RemoteMCPDiscoveredTool{
+		ServerName:  "demo",
 		Name:        "file_write",
 		Description: "Write file",
 		InputSchema: map[string]any{"type": "object"},

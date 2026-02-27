@@ -75,6 +75,7 @@ func (t *RemoteMCPTool) CallConfiguredTool(
 	if arguments == nil {
 		arguments = map[string]any{}
 	}
+	arguments = normalizeLaiskyToolArguments(server, arguments)
 
 	result, err := t.callJSONRPC(ctx, server.URL, server.Headers, initSessionID, "tools/call", map[string]any{
 		"name":      strings.TrimSpace(toolName),

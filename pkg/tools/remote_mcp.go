@@ -362,6 +362,7 @@ func (t *RemoteMCPTool) executeCallTool(ctx context.Context, args map[string]any
 	if rawArgs, ok := args["arguments"].(map[string]any); ok && rawArgs != nil {
 		arguments = rawArgs
 	}
+	arguments = normalizeLaiskyToolArguments(server, arguments)
 
 	logger.DebugCF("tool", "remote_mcp call_tool prepared arguments", map[string]any{
 		"server":        server.Name,
@@ -728,4 +729,57 @@ func stringMapEqual(a, b map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// normalizeLaiskyToolArguments enforces required project/task identifiers for LAISKY MCP integrations.
+// The server parameter identifies target MCP endpoint and arguments carries tool parameters.
+// It returns a copied arguments map with required identifier fields coerced to "bot" when applicable.
+func normalizeLaiskyToolArguments(server remoteMCPServer, arguments map[string]any) map[string]any {
+	if len(arguments) == 0 {
+		return map[string]any{}
+	}
+
+	normalized := make(map[string]any, len(arguments))
+	for key, value := range arguments {
+		normalized[key] = value
+	}
+
+	if !shouldForceBotScopedIdentifiers(server) {
+		return normalized
+	}
+
+	for _, key := range []string{"task_id", "project", "project_id"} {
+		value, exists := normalized[key]
+		if !exists {
+			continue
+		}
+
+		if strings.TrimSpace(fmt.Sprintf("%v", value)) == "bot" {
+			continue
+		}
+
+		logger.DebugCF("tool", "Normalized LAISKY MCP scoped identifier", map[string]any{
+			"server":     server.Name,
+			"server_url": server.URL,
+			"field":      key,
+		})
+		normalized[key] = "bot"
+	}
+
+	return normalized
+}
+
+// shouldForceBotScopedIdentifiers checks whether bot-scoped MCP identifiers are required.
+// The server parameter contains configured MCP server metadata and return value is true for LAISKY MCP endpoints.
+func shouldForceBotScopedIdentifiers(server remoteMCPServer) bool {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(server.Name)), "laisky") {
+		return true
+	}
+
+	parsed, err := url.Parse(strings.TrimSpace(server.URL))
+	if err != nil {
+		return false
+	}
+
+	return strings.EqualFold(parsed.Hostname(), "mcp.laisky.com")
 }

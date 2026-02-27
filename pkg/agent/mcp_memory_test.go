@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -150,4 +151,63 @@ func TestInjectMCPMemoryRecall(t *testing.T) {
 	require.Equal(t, "hello", updated[3].Content)
 	require.Contains(t, updated[2].Content, "MCP Memory Recall")
 	require.Contains(t, updated[2].Content, "timezone is UTC")
+}
+
+// TestMCPMemoryBeforeTurnUsesBotProject verifies beforeTurn sends required project identifier "bot".
+// The t parameter controls test lifecycle and the function returns no value.
+func TestMCPMemoryBeforeTurnUsesBotProject(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		var req map[string]any
+		err := json.NewDecoder(r.Body).Decode(&req)
+		require.NoError(t, err)
+
+		method, _ := req["method"].(string)
+		switch method {
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", "session-memory")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req["id"],
+				"result":  map[string]any{"protocolVersion": "2024-11-05"},
+			})
+		case "tools/call":
+			params, _ := req["params"].(map[string]any)
+			require.Equal(t, memoryBeforeToolName, fmt.Sprintf("%v", params["name"]))
+			args, _ := params["arguments"].(map[string]any)
+			require.Equal(t, "bot", fmt.Sprintf("%v", args["project"]))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req["id"],
+				"result": map[string]any{
+					"isError": false,
+					"structuredContent": map[string]any{
+						"input_items": []map[string]any{{
+							"type": "message",
+							"role": "user",
+							"content": []map[string]any{{
+								"type": "input_text",
+								"text": "hello",
+							}},
+						}},
+					},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	client := &mcpTurnMemoryClient{
+		endpoint: server.URL,
+		headers:  map[string]string{},
+		client:   server.Client(),
+	}
+
+	turn, recall, err := client.beforeTurn(context.Background(), "session-key", "user-id", "hello")
+	require.NoError(t, err)
+	require.NotNil(t, turn)
+	require.Empty(t, recall)
 }

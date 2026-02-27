@@ -20,7 +20,7 @@ import (
 
 const (
 	memoryMCPHost            = "mcp.laisky.com"
-	memoryMCPProjectID       = "picoclaw"
+	memoryMCPProjectID       = "bot"
 	memoryBeforeToolName     = "memory_before_turn"
 	memoryAfterToolName      = "memory_after_turn"
 	memoryMCPRequestTimeout  = 20 * time.Second
@@ -293,6 +293,13 @@ func (c *mcpTurnMemoryClient) callTool(ctx context.Context, toolName string, arg
 	}
 
 	if payload.IsError {
+		code, message, retryable := extractMemoryToolErrorFields(payload)
+		logger.DebugCF("agent", "MCP memory tool returned error payload", map[string]any{
+			"tool":       toolName,
+			"error_code": code,
+			"message":    message,
+			"retryable":  retryable,
+		})
 		if payload.Error != nil {
 			return fmt.Errorf("memory tool %q failed: %s (%s), retryable=%v", toolName, payload.Error.Message, payload.Error.Code, payload.Error.Retryable)
 		}
@@ -610,4 +617,29 @@ func hasAuthorizationHeader(headers map[string]string) bool {
 	}
 
 	return false
+}
+
+// extractMemoryToolErrorFields extracts normalized error fields from MCP tool payload.
+// The payload parameter is decoded tools/call output and return values are code, message, and retryable.
+func extractMemoryToolErrorFields(payload *memoryToolCallResult) (string, string, bool) {
+	if payload == nil {
+		return "", "", false
+	}
+
+	if payload.Error != nil {
+		return strings.TrimSpace(payload.Error.Code), strings.TrimSpace(payload.Error.Message), payload.Error.Retryable
+	}
+
+	if payload.StructuredContent == nil {
+		return "", "", false
+	}
+
+	code := strings.TrimSpace(fmt.Sprintf("%v", payload.StructuredContent["code"]))
+	message := strings.TrimSpace(fmt.Sprintf("%v", payload.StructuredContent["message"]))
+	retryable := false
+	if value, ok := payload.StructuredContent["retryable"].(bool); ok {
+		retryable = value
+	}
+
+	return code, message, retryable
 }
