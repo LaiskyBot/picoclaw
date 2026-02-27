@@ -284,3 +284,71 @@ func TestRemoteMCPProxyToolExecute(t *testing.T) {
 	require.False(t, result.IsError)
 	require.Contains(t, result.ForUser, "\"ok\": true")
 }
+
+// TestParseDiscoveredToolsResultNormalizesArrayItems verifies array schemas get default items when missing.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestParseDiscoveredToolsResultNormalizesArrayItems(t *testing.T) {
+	result := map[string]any{
+		"tools": []any{
+			map[string]any{
+				"name": "memory_after_turn",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"input_items": map[string]any{"type": "array"},
+					},
+				},
+			},
+		},
+	}
+
+	parsed, err := parseDiscoveredToolsResult("laisky", result)
+	require.NoError(t, err)
+	require.Len(t, parsed, 1)
+
+	props, ok := parsed[0].InputSchema["properties"].(map[string]any)
+	require.True(t, ok)
+	inputItems, ok := props["input_items"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "array", inputItems["type"])
+	_, hasItems := inputItems["items"]
+	require.True(t, hasItems)
+}
+
+// TestNormalizeRemoteToolSchemaValueNestedArrays verifies recursive normalization for nested array schemas.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestNormalizeRemoteToolSchemaValueNestedArrays(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"outer": map[string]any{
+				"type": "array",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"inner": map[string]any{"type": "array"},
+					},
+				},
+			},
+		},
+	}
+
+	normalized, changed := normalizeRemoteToolSchema(schema)
+	require.True(t, changed)
+
+	props, ok := normalized["properties"].(map[string]any)
+	require.True(t, ok)
+	outer, ok := props["outer"].(map[string]any)
+	require.True(t, ok)
+	outerItems, ok := outer["items"].(map[string]any)
+	require.True(t, ok)
+	innerProps, ok := outerItems["properties"].(map[string]any)
+	require.True(t, ok)
+	inner, ok := innerProps["inner"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "array", inner["type"])
+	_, hasItems := inner["items"]
+	require.True(t, hasItems)
+}

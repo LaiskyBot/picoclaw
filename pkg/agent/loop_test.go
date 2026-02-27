@@ -64,6 +64,20 @@ func TestBuildDesiredRemoteProxyNames(t *testing.T) {
 	require.Contains(t, desired, "read_file")
 }
 
+// TestBuildDesiredRemoteProxyNames_TrimmedDuplicateNames verifies duplicate detection uses trimmed names.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestBuildDesiredRemoteProxyNames_TrimmedDuplicateNames(t *testing.T) {
+	desired := buildDesiredRemoteProxyNames([]tools.RemoteMCPDiscoveredTool{
+		{ServerName: "alpha", Name: "memory_after_turn"},
+		{ServerName: "beta", Name: " memory_after_turn "},
+	})
+
+	require.Contains(t, desired, "alpha__memory_after_turn")
+	require.Contains(t, desired, "beta__memory_after_turn")
+	require.NotContains(t, desired, "memory_after_turn")
+}
+
 // TestApplyRemoteMCPToolsToRegistry verifies dynamic remote tools are registered and stale tools are removed.
 // The t parameter controls test lifecycle.
 // It returns no value and fails the test on assertion errors.

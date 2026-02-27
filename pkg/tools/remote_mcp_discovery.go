@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/sipeed/picoclaw/pkg/logger"
 )
 
 // DiscoverConfiguredTools enumerates all tools from configured remote MCP servers.
@@ -119,7 +121,14 @@ func parseDiscoveredToolsResult(serverName string, result any) ([]RemoteMCPDisco
 		description := strings.TrimSpace(fmt.Sprintf("%v", entry["description"]))
 		inputSchema := map[string]any{"type": "object"}
 		if rawSchema, ok := entry["inputSchema"].(map[string]any); ok && rawSchema != nil {
-			inputSchema = rawSchema
+			normalized, changed := normalizeRemoteToolSchema(rawSchema)
+			inputSchema = normalized
+			if changed {
+				logger.DebugCF("tool", "Normalized remote MCP tool schema for provider compatibility", map[string]any{
+					"server": serverName,
+					"tool":   name,
+				})
+			}
 		}
 
 		toolsList = append(toolsList, RemoteMCPDiscoveredTool{
@@ -131,4 +140,61 @@ func parseDiscoveredToolsResult(serverName string, result any) ([]RemoteMCPDisco
 	}
 
 	return toolsList, nil
+}
+
+// normalizeRemoteToolSchema normalizes remote JSON schema to avoid provider validation failures.
+// The schema parameter is the discovered inputSchema and it returns normalized schema plus whether it changed.
+func normalizeRemoteToolSchema(schema map[string]any) (map[string]any, bool) {
+	if schema == nil {
+		return map[string]any{"type": "object"}, true
+	}
+
+	cloned, changed := normalizeRemoteToolSchemaValue(schema)
+	result, ok := cloned.(map[string]any)
+	if !ok || result == nil {
+		return map[string]any{"type": "object"}, true
+	}
+
+	return result, changed
+}
+
+// normalizeRemoteToolSchemaValue recursively normalizes one schema node.
+// The value parameter accepts arbitrary decoded JSON and returns normalized value plus changed flag.
+func normalizeRemoteToolSchemaValue(value any) (any, bool) {
+	switch node := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(node)+1)
+		changed := false
+
+		for key, raw := range node {
+			norm, childChanged := normalizeRemoteToolSchemaValue(raw)
+			out[key] = norm
+			if childChanged {
+				changed = true
+			}
+		}
+
+		typeValue, _ := out["type"].(string)
+		if strings.EqualFold(strings.TrimSpace(typeValue), "array") {
+			if _, ok := out["items"]; !ok {
+				out["items"] = map[string]any{}
+				changed = true
+			}
+		}
+
+		return out, changed
+	case []any:
+		out := make([]any, len(node))
+		changed := false
+		for idx, item := range node {
+			norm, childChanged := normalizeRemoteToolSchemaValue(item)
+			out[idx] = norm
+			if childChanged {
+				changed = true
+			}
+		}
+		return out, changed
+	default:
+		return value, false
+	}
 }

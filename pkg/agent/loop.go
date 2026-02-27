@@ -267,6 +267,12 @@ func applyRemoteMCPToolsToRegistry(
 			}
 		}
 
+		logger.DebugCF("agent", "Injecting remote MCP proxy tool", map[string]any{
+			"agent_id":   agentID,
+			"proxy_name": proxyName,
+			"server_name": item.ServerName,
+			"remote_tool": item.Name,
+		})
 		registry.Register(tools.NewRemoteMCPProxyTool(proxyName, item, remoteClient))
 		newInjected[proxyName] = struct{}{}
 	}
@@ -311,7 +317,7 @@ func buildDesiredRemoteProxyNames(discovered []tools.RemoteMCPDiscoveredTool) ma
 		}
 
 		proxyName := base
-		if nameCount[item.Name] > 1 {
+		if nameCount[strings.TrimSpace(item.Name)] > 1 {
 			proxyName = sanitizeDynamicToolName(item.ServerName) + "__" + base
 		}
 
