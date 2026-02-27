@@ -713,4 +713,5 @@ func TestBuildPlannerDelegationPrompt_IncludesDelegationContext(t *testing.T) {
 	require.Contains(t, prompt, "Do not include internal task IDs")
 	require.Contains(t, prompt, promptLengthControlHint)
 	require.Contains(t, prompt, "User request:")
+	require.Less(t, strings.Index(prompt, "Use tools to complete the task end-to-end."), strings.Index(prompt, "Task tracking id:"))
 }

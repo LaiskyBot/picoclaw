@@ -157,9 +157,20 @@ func TestRunAgentLoop_UsesMCPMemoryLifecycle(t *testing.T) {
 
 	require.NotEmpty(t, recordingProvider.lastMessages)
 	systemPrompt := recordingProvider.lastMessages[0].Content
-	require.Contains(t, systemPrompt, "MCP Memory Recall")
-	require.Contains(t, systemPrompt, "project prefers concise updates")
+	require.NotContains(t, systemPrompt, "MCP Memory Recall")
 	require.NotContains(t, systemPrompt, "FILE_MEMORY_SHOULD_NOT_APPEAR")
+
+	var recallInserted bool
+	for idx, msg := range recordingProvider.lastMessages {
+		if msg.Role != "assistant" || !strings.Contains(msg.Content, "MCP Memory Recall") {
+			continue
+		}
+		require.Contains(t, msg.Content, "project prefers concise updates")
+		require.Less(t, idx, len(recordingProvider.lastMessages)-1)
+		require.Equal(t, "user", recordingProvider.lastMessages[len(recordingProvider.lastMessages)-1].Role)
+		recallInserted = true
+	}
+	require.True(t, recallInserted)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -271,9 +282,9 @@ func TestRunAgentLoop_MemoryLifecycleUsesToolChatID(t *testing.T) {
 	require.Equal(t, "telegram-chat-42", capturedBeforeArgs["user_id"])
 }
 
-// TestRunAgentLoop_MemoryBeforeTurnFailureInjectsLocalFallback verifies local recent context is injected when remote memory recall fails.
+// TestRunAgentLoop_MemoryBeforeTurnFailureKeepsRecentHistoryMessages verifies recent session turns are included as actual history messages when remote memory recall fails.
 // The t parameter controls assertions and returns no value.
-func TestRunAgentLoop_MemoryBeforeTurnFailureInjectsLocalFallback(t *testing.T) {
+func TestRunAgentLoop_MemoryBeforeTurnFailureKeepsRecentHistoryMessages(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -361,9 +372,67 @@ func TestRunAgentLoop_MemoryBeforeTurnFailureInjectsLocalFallback(t *testing.T) 
 
 	require.NotEmpty(t, provider.lastMessages)
 	systemPrompt := provider.lastMessages[0].Content
-	require.Contains(t, systemPrompt, "Recent Session Context")
-	require.Contains(t, systemPrompt, "Barrhaven")
-	require.Contains(t, systemPrompt, "Local Context Fallback")
+	require.NotContains(t, systemPrompt, "Recent Session Context")
+	require.NotContains(t, systemPrompt, "Local Context Fallback")
+
+	var hasUserHistory bool
+	var hasAssistantHistory bool
+	for _, msg := range provider.lastMessages {
+		if msg.Role == "user" && strings.Contains(msg.Content, "Barrhaven") {
+			hasUserHistory = true
+		}
+		if msg.Role == "assistant" && strings.Contains(msg.Content, "已记录") {
+			hasAssistantHistory = true
+		}
+	}
+	require.True(t, hasUserHistory)
+	require.True(t, hasAssistantHistory)
+}
+
+// TestRunAgentLoop_RecentHistoryLimitApplied verifies only recent N history messages are included in LLM request.
+// The t parameter controls assertions and returns no value.
+func TestRunAgentLoop_RecentHistoryLimitApplied(t *testing.T) {
+	tmpDir := t.TempDir()
+	provider := &recordingMockProvider{response: "ok"}
+
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = tmpDir
+	cfg.Agents.Defaults.Model = "test-model"
+	cfg.Agents.Defaults.RecentHistoryLimit = 3
+
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), provider)
+	defaultAgent := al.registry.GetDefaultAgent()
+	require.NotNil(t, defaultAgent)
+
+	sessionKey := "agent:main:direct:user-2"
+	defaultAgent.Sessions.AddMessage(sessionKey, "user", "u1")
+	defaultAgent.Sessions.AddMessage(sessionKey, "assistant", "a1")
+	defaultAgent.Sessions.AddMessage(sessionKey, "user", "u2")
+	defaultAgent.Sessions.AddMessage(sessionKey, "assistant", "a2")
+	defaultAgent.Sessions.AddMessage(sessionKey, "user", "u3")
+
+	_, err := al.runAgentLoop(context.Background(), defaultAgent, processOptions{
+		SessionKey:      sessionKey,
+		Channel:         "telegram",
+		ChatID:          "chat-2",
+		UserMessage:     "u4",
+		DefaultResponse: "empty",
+		EnableSummary:   false,
+		SendResponse:    false,
+		NoHistory:       false,
+	})
+	require.NoError(t, err)
+
+	require.Len(t, provider.lastMessages, 5)
+	require.Equal(t, "system", provider.lastMessages[0].Role)
+	require.Equal(t, "user", provider.lastMessages[1].Role)
+	require.Equal(t, "assistant", provider.lastMessages[2].Role)
+	require.Equal(t, "user", provider.lastMessages[3].Role)
+	require.Equal(t, "user", provider.lastMessages[4].Role)
+	require.Equal(t, "u2", provider.lastMessages[1].Content)
+	require.Equal(t, "a2", provider.lastMessages[2].Content)
+	require.Equal(t, "u3", provider.lastMessages[3].Content)
+	require.Equal(t, "u4", provider.lastMessages[4].Content)
 }
 
 // TestRunAgentLoop_EmptyDefaultResponseStillReturnsNonEmpty verifies global non-empty fallback when model and default output are blank.

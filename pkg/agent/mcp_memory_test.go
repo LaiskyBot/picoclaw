@@ -52,16 +52,22 @@ func TestExtractRecallText(t *testing.T) {
 	require.Equal(t, "Memory recall: User prefers concise answers.", recall)
 }
 
-// TestInjectMCPMemoryRecall verifies memory recall is appended into first system prompt block.
+// TestInjectMCPMemoryRecall verifies memory recall is inserted before latest user message.
 // The t parameter controls test lifecycle and the function returns no value.
 func TestInjectMCPMemoryRecall(t *testing.T) {
 	messages := []providers.Message{
 		{Role: "system", Content: "base-system"},
+		{Role: "assistant", Content: "prior answer"},
 		{Role: "user", Content: "hello"},
 	}
 
 	updated := injectMCPMemoryRecall(messages, "Memory recall: timezone is UTC")
-	require.Contains(t, updated[0].Content, "base-system")
-	require.Contains(t, updated[0].Content, "MCP Memory Recall")
-	require.Contains(t, updated[0].Content, "timezone is UTC")
+	require.Len(t, updated, 4)
+	require.Equal(t, "system", updated[0].Role)
+	require.Equal(t, "assistant", updated[1].Role)
+	require.Equal(t, "assistant", updated[2].Role)
+	require.Equal(t, "user", updated[3].Role)
+	require.Equal(t, "hello", updated[3].Content)
+	require.Contains(t, updated[2].Content, "MCP Memory Recall")
+	require.Contains(t, updated[2].Content, "timezone is UTC")
 }

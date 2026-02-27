@@ -18,6 +18,7 @@ func DefaultConfig() *Config {
 				Temperature:         nil, // nil means use provider default
 				MaxToolIterations:   20,
 				TaskMaxParallel:     4,
+				RecentHistoryLimit:  6,
 			},
 		},
 		Bindings: []AgentBinding{},

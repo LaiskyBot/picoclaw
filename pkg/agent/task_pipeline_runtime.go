@@ -146,6 +146,7 @@ func (al *AgentLoop) executePlannerTask(parentCtx context.Context, task *Pipelin
 
 	plannerPrompt := buildPlannerDelegationPrompt(task)
 	sessionKey := fmt.Sprintf("agent:%s:pipeline:%s", runner.ID, task.ID)
+	recentHistory := al.loadTaskConversationRecentHistory(task)
 
 	result, err := al.runAgentLoop(runCtx, runner, processOptions{
 		SessionKey:      sessionKey,
@@ -153,6 +154,7 @@ func (al *AgentLoop) executePlannerTask(parentCtx context.Context, task *Pipelin
 		ChatID:          task.ID,
 		ToolChannel:     task.Channel,
 		ToolChatID:      task.ChatID,
+		RecentHistory:   recentHistory,
 		UserMessage:     plannerPrompt,
 		DefaultResponse: plannerEmptySummaryText,
 		EnableSummary:   false,
@@ -190,6 +192,27 @@ func (al *AgentLoop) executePlannerTask(parentCtx context.Context, task *Pipelin
 	al.taskPipeline.MarkPlannerCompleted(task.ID, result)
 	al.taskPipeline.CheckpointTask(task.ID, "planner run completed")
 	al.publishTaskFinalReport(task.ID, result, nil)
+}
+
+// loadTaskConversationRecentHistory returns routed conversation history for delegated planner requests.
+// The task parameter carries routed agent/session metadata and return value is nil when context is unavailable.
+func (al *AgentLoop) loadTaskConversationRecentHistory(task *PipelineTask) []providers.Message {
+	if al == nil || al.registry == nil || task == nil {
+		return nil
+	}
+
+	agentID := strings.TrimSpace(task.ConversationAgentID)
+	sessionKey := strings.TrimSpace(task.ConversationSessionKey)
+	if agentID == "" || sessionKey == "" {
+		return nil
+	}
+
+	agent, ok := al.registry.GetAgent(agentID)
+	if !ok || agent == nil || agent.Sessions == nil {
+		return nil
+	}
+
+	return agent.Sessions.GetHistory(sessionKey)
 }
 
 // publishTaskFinalReport sends a structured completion report to the chat.

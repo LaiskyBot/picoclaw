@@ -242,6 +242,15 @@ func TestDefaultConfig_TaskMaxParallel(t *testing.T) {
 	}
 }
 
+// TestDefaultConfig_RecentHistoryLimit verifies recent history limit default value.
+func TestDefaultConfig_RecentHistoryLimit(t *testing.T) {
+	cfg := DefaultConfig()
+
+	if cfg.Agents.Defaults.RecentHistoryLimit != 6 {
+		t.Errorf("RecentHistoryLimit should default to 6, got %d", cfg.Agents.Defaults.RecentHistoryLimit)
+	}
+}
+
 // TestDefaultConfig_Temperature verifies temperature has default value
 func TestDefaultConfig_Temperature(t *testing.T) {
 	cfg := DefaultConfig()

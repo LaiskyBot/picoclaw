@@ -30,17 +30,18 @@ import (
 )
 
 type AgentLoop struct {
-	bus             *bus.MessageBus
-	cfg             *config.Config
-	registry        *AgentRegistry
-	state           *state.Manager
-	taskPipeline    *TaskPipeline
-	taskMaxParallel int
-	running         atomic.Bool
-	summarizing     sync.Map
-	fallback        *providers.FallbackChain
-	channelManager  *channels.Manager
-	memoryMCP       *mcpTurnMemoryClient
+	bus                *bus.MessageBus
+	cfg                *config.Config
+	registry           *AgentRegistry
+	state              *state.Manager
+	taskPipeline       *TaskPipeline
+	taskMaxParallel    int
+	recentHistoryLimit int
+	running            atomic.Bool
+	summarizing        sync.Map
+	fallback           *providers.FallbackChain
+	channelManager     *channels.Manager
+	memoryMCP          *mcpTurnMemoryClient
 }
 
 const promptLengthControlHint = "Length control: keep output concise, prefer summaries over raw long logs/HTML, and avoid unnecessary long excerpts."
@@ -49,16 +50,17 @@ const nonEmptyDefaultResponse = "I've completed processing but have no response 
 
 // processOptions configures how a message is processed
 type processOptions struct {
-	SessionKey      string // Session identifier for history/context
-	Channel         string // Target channel for tool execution
-	ChatID          string // Target chat ID for tool execution
-	ToolChannel     string // Optional channel override used only for tool context injection
-	ToolChatID      string // Optional chat ID override used only for tool context injection
-	UserMessage     string // User message content (may include prefix)
-	DefaultResponse string // Response when LLM returns empty
-	EnableSummary   bool   // Whether to trigger summarization
-	SendResponse    bool   // Whether to send response via bus
-	NoHistory       bool   // If true, don't load session history (for heartbeat)
+	SessionKey      string              // Session identifier for history/context
+	Channel         string              // Target channel for tool execution
+	ChatID          string              // Target chat ID for tool execution
+	ToolChannel     string              // Optional channel override used only for tool context injection
+	ToolChatID      string              // Optional chat ID override used only for tool context injection
+	RecentHistory   []providers.Message // Optional preloaded history for LLM request composition
+	UserMessage     string              // User message content (may include prefix)
+	DefaultResponse string              // Response when LLM returns empty
+	EnableSummary   bool                // Whether to trigger summarization
+	SendResponse    bool                // Whether to send response via bus
+	NoHistory       bool                // If true, don't load session history (for heartbeat)
 }
 
 func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers.LLMProvider) *AgentLoop {
@@ -81,15 +83,16 @@ func NewAgentLoop(cfg *config.Config, msgBus *bus.MessageBus, provider providers
 	}
 
 	return &AgentLoop{
-		bus:             msgBus,
-		cfg:             cfg,
-		registry:        registry,
-		state:           stateManager,
-		taskPipeline:    taskPipeline,
-		taskMaxParallel: cfg.Agents.Defaults.TaskMaxParallel,
-		summarizing:     sync.Map{},
-		fallback:        fallbackChain,
-		memoryMCP:       newMCPMemoryClientFromRemote(cfg.Tools.MCP.Remote),
+		bus:                msgBus,
+		cfg:                cfg,
+		registry:           registry,
+		state:              stateManager,
+		taskPipeline:       taskPipeline,
+		taskMaxParallel:    cfg.Agents.Defaults.TaskMaxParallel,
+		recentHistoryLimit: cfg.Agents.Defaults.RecentHistoryLimit,
+		summarizing:        sync.Map{},
+		fallback:           fallbackChain,
+		memoryMCP:          newMCPMemoryClientFromRemote(cfg.Tools.MCP.Remote),
 	}
 }
 
@@ -599,14 +602,16 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	}
 
 	// 1. Build messages (skip history for heartbeat)
-	var history []providers.Message
+	var sessionHistory []providers.Message
 	var summary string
 	if !opts.NoHistory {
-		history = agent.Sessions.GetHistory(opts.SessionKey)
+		sessionHistory = agent.Sessions.GetHistory(opts.SessionKey)
 		summary = agent.Sessions.GetSummary(opts.SessionKey)
 	}
 
-	delegationReference := buildDelegationReference(agent, history, summary)
+	historyForRequest := pickRecentHistoryForRequest(sessionHistory, opts.RecentHistory, al.recentHistoryLimit)
+
+	delegationReference := buildDelegationReference(agent, sessionHistory, summary)
 
 	// 2. Update tool contexts
 	toolChannel := opts.Channel
@@ -631,14 +636,21 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 
 	// 3. Build messages
 	messages := agent.ContextBuilder.BuildMessages(
-		history,
+		historyForRequest,
 		summary,
 		opts.UserMessage,
 		nil,
 		opts.Channel,
 		opts.ChatID,
 	)
-	messages = injectRecentSessionContext(messages, history)
+
+	logger.DebugCF("agent", "Prepared recent conversation history for LLM request", map[string]any{
+		"session_key":           opts.SessionKey,
+		"recent_history_limit":  al.recentHistoryLimit,
+		"session_history_count": len(sessionHistory),
+		"request_history_count": len(historyForRequest),
+		"preloaded_history":     len(opts.RecentHistory),
+	})
 
 	var memoryTurn *memoryTurnContext
 	memoryUserID := resolveMemoryUserID(opts)
@@ -651,20 +663,19 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 		})
 		turn, recallText, memErr := al.memoryMCP.beforeTurn(ctx, opts.SessionKey, memoryUserID, opts.UserMessage)
 		if memErr != nil {
-			fallbackContext := buildRecentSessionContext(history, 6)
-			if fallbackContext != "" {
-				messages = injectMemoryFailureFallback(messages, fallbackContext)
-			}
 			logger.WarnCF("agent", "memory_before_turn call failed", map[string]any{
-				"agent_id":               agent.ID,
-				"session_key":            opts.SessionKey,
-				"memory_user_id":         memoryUserID,
-				"error":                  memErr.Error(),
-				"fallback_context_chars": len(fallbackContext),
+				"agent_id":       agent.ID,
+				"session_key":    opts.SessionKey,
+				"memory_user_id": memoryUserID,
+				"error":          memErr.Error(),
 			})
 		} else {
 			memoryTurn = turn
 			messages = injectMCPMemoryRecall(messages, recallText)
+			logger.DebugCF("agent", "Injected memory recall near latest user message for cache-friendly prompt prefix", map[string]any{
+				"session_key":  opts.SessionKey,
+				"recall_chars": len(strings.TrimSpace(recallText)),
+			})
 		}
 	}
 
@@ -781,68 +792,59 @@ func resolveMemoryUserID(opts processOptions) string {
 	return "unknown"
 }
 
-// injectMCPMemoryRecall appends memory recall text into the first system message.
-// The messages parameter is provider message list and recallText is the non-empty recalled memory excerpt.
-// It returns the updated message slice and preserves all non-system messages.
+// injectMCPMemoryRecall inserts memory recall near the tail of message list.
+// The messages parameter is provider message list and recallText is non-empty recalled memory excerpt.
+// It returns an updated slice that keeps the longest possible prompt prefix unchanged for cache reuse.
 func injectMCPMemoryRecall(messages []providers.Message, recallText string) []providers.Message {
 	trimmedRecall := strings.TrimSpace(recallText)
-	if len(messages) == 0 || trimmedRecall == "" {
+	if trimmedRecall == "" {
 		return messages
 	}
 
-	for idx := range messages {
-		if messages[idx].Role != "system" {
-			continue
-		}
-		messages[idx].Content = strings.TrimSpace(messages[idx].Content) + "\n\n---\n\n## MCP Memory Recall\n" + trimmedRecall
-		return messages
+	recallMsg := providers.Message{
+		Role:    "assistant",
+		Content: "MCP Memory Recall:\n" + trimmedRecall,
 	}
 
-	return messages
+	if len(messages) == 0 {
+		return []providers.Message{recallMsg}
+	}
+
+	insertAt := len(messages)
+	if messages[len(messages)-1].Role == "user" {
+		insertAt = len(messages) - 1
+	}
+
+	updated := make([]providers.Message, 0, len(messages)+1)
+	updated = append(updated, messages[:insertAt]...)
+	updated = append(updated, recallMsg)
+	updated = append(updated, messages[insertAt:]...)
+
+	return updated
 }
 
-// injectRecentSessionContext appends compact recent session turns into the first system message.
-// The messages parameter is provider message list, history contains routed session turns, and return value preserves all non-system messages.
-func injectRecentSessionContext(messages []providers.Message, history []providers.Message) []providers.Message {
-	recent := buildRecentSessionContext(history, 6)
-	if recent == "" {
-		return messages
+// pickRecentHistoryForRequest selects recent history messages for model input.
+// The sessionHistory parameter is persisted session history, preloadedHistory can override source,
+// and limit controls how many tail messages to include (<=0 means include all).
+func pickRecentHistoryForRequest(sessionHistory, preloadedHistory []providers.Message, limit int) []providers.Message {
+	base := sessionHistory
+	if len(preloadedHistory) > 0 {
+		base = preloadedHistory
+	}
+	if len(base) == 0 {
+		return nil
 	}
 
-	for idx := range messages {
-		if messages[idx].Role != "system" {
-			continue
-		}
-		messages[idx].Content = strings.TrimSpace(messages[idx].Content) + "\n\n---\n\n## Recent Session Context\n" + recent
-		return messages
+	if limit <= 0 || len(base) <= limit {
+		out := make([]providers.Message, len(base))
+		copy(out, base)
+		return out
 	}
 
-	return messages
-}
-
-// injectMemoryFailureFallback appends a local recent-context fallback into first system message.
-// The messages parameter is provider message list and fallback is compact local context used when remote memory lookup fails.
-func injectMemoryFailureFallback(messages []providers.Message, fallback string) []providers.Message {
-	trimmedFallback := strings.TrimSpace(fallback)
-	if len(messages) == 0 || trimmedFallback == "" {
-		return messages
-	}
-
-	for idx := range messages {
-		if messages[idx].Role != "system" {
-			continue
-		}
-		messages[idx].Content = strings.TrimSpace(messages[idx].Content) + "\n\n---\n\n## Local Context Fallback\n" + trimmedFallback
-		return messages
-	}
-
-	return messages
-}
-
-// buildRecentSessionContext renders a compact user/assistant context excerpt.
-// The history parameter is session messages and maxMessages limits number of recent entries in output.
-func buildRecentSessionContext(history []providers.Message, maxMessages int) string {
-	return formatRecentConversationHistory(history, maxMessages)
+	start := len(base) - limit
+	out := make([]providers.Message, len(base[start:]))
+	copy(out, base[start:])
+	return out
 }
 
 // runLLMIteration executes the LLM call loop with tool handling.
