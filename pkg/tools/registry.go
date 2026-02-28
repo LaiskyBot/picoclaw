@@ -77,6 +77,18 @@ func (r *ToolRegistry) ExecuteWithContext(
 		return ErrorResult(fmt.Sprintf("tool %q not found", name)).WithError(fmt.Errorf("tool not found"))
 	}
 
+	toolLogFields := map[string]any{
+		"tool":      name,
+		"tool_impl": fmt.Sprintf("%T", tool),
+		"tool_kind": "local",
+	}
+	if remoteProxy, isRemoteProxy := tool.(*RemoteMCPProxyTool); isRemoteProxy {
+		toolLogFields["tool_kind"] = "remote_mcp_proxy"
+		toolLogFields["remote_server"] = remoteProxy.serverName
+		toolLogFields["remote_tool"] = remoteProxy.remoteTool
+	}
+	logger.DebugCF("tool", "Resolved tool implementation", toolLogFields)
+
 	// If tool implements ContextualTool, set context
 	if contextualTool, ok := tool.(ContextualTool); ok && channel != "" && chatID != "" {
 		contextualTool.SetContext(channel, chatID)

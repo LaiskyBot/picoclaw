@@ -98,10 +98,10 @@ func TestApplyRemoteMCPToolsToRegistry(t *testing.T) {
 	require.False(t, exists)
 }
 
-// TestApplyRemoteMCPToolsToRegistrySkipsCollisions verifies collisions do not override local tools.
+// TestApplyRemoteMCPToolsToRegistryRegistersCollisionAlias verifies collisions preserve local tools and inject remote aliases.
 // The t parameter controls test lifecycle.
 // It returns no value and fails the test on assertion errors.
-func TestApplyRemoteMCPToolsToRegistrySkipsCollisions(t *testing.T) {
+func TestApplyRemoteMCPToolsToRegistryRegistersCollisionAlias(t *testing.T) {
 	registry := tools.NewToolRegistry()
 	registry.Register(&mockCustomTool{})
 
@@ -119,6 +119,38 @@ func TestApplyRemoteMCPToolsToRegistrySkipsCollisions(t *testing.T) {
 	require.True(t, exists)
 	_, isProxy := toolObj.(*tools.RemoteMCPProxyTool)
 	require.False(t, isProxy)
+
+	aliasToolObj, aliasExists := registry.Get("alpha__mock_custom")
+	require.True(t, aliasExists)
+	_, aliasIsProxy := aliasToolObj.(*tools.RemoteMCPProxyTool)
+	require.True(t, aliasIsProxy)
+}
+
+// TestApplyRemoteMCPToolsToRegistryCollisionAliasSuffix verifies alias suffix fallback when preferred alias already exists.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestApplyRemoteMCPToolsToRegistryCollisionAliasSuffix(t *testing.T) {
+	registry := tools.NewToolRegistry()
+	registry.Register(&mockCustomTool{})
+	registry.Register(&mockToolWithName{name: "alpha__mock_custom"})
+
+	remoteClient := tools.NewRemoteMCPTool(t.TempDir())
+	injectedStore := map[string]map[string]struct{}{}
+
+	applyRemoteMCPToolsToRegistry("main", registry, remoteClient, []tools.RemoteMCPDiscoveredTool{{
+		ServerName:  "alpha",
+		Name:        "mock_custom",
+		Description: "collision",
+		InputSchema: map[string]any{"type": "object"},
+	}}, injectedStore)
+
+	_, aliasExists := registry.Get("alpha__mock_custom")
+	require.True(t, aliasExists)
+
+	aliasToolObj, alias2Exists := registry.Get("alpha__mock_custom__2")
+	require.True(t, alias2Exists)
+	_, alias2IsProxy := aliasToolObj.(*tools.RemoteMCPProxyTool)
+	require.True(t, alias2IsProxy)
 }
 
 // TestRunAgentLoop_UsesMCPMemoryLifecycle verifies laisky MCP memory hooks run before/after model turns.
@@ -682,6 +714,28 @@ func TestNewAgentLoop_BootstrapsConfiguredRemoteMCPServers(t *testing.T) {
 	require.Equal(t, "Bearer test-token", payload.Servers[0].Headers["Authorization"])
 }
 
+// TestNewAgentLoop_DoesNotPreRegisterLocalWebTools verifies web tools are not preloaded locally.
+// The t parameter controls test lifecycle.
+// It returns no value and fails when local web_search/web_fetch are registered before MCP discovery.
+func TestNewAgentLoop_DoesNotPreRegisterLocalWebTools(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = tmpDir
+	cfg.Agents.Defaults.Model = "test-model"
+
+	msgBus := bus.NewMessageBus()
+	provider := &mockProvider{}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	defaultAgent := al.registry.GetDefaultAgent()
+	require.NotNil(t, defaultAgent)
+
+	_, hasWebSearch := defaultAgent.Tools.Get("web_search")
+	_, hasWebFetch := defaultAgent.Tools.Get("web_fetch")
+	require.False(t, hasWebSearch)
+	require.False(t, hasWebFetch)
+}
+
 func TestRecordLastChannel(t *testing.T) {
 	// Create temp workspace
 	tmpDir, err := os.MkdirTemp("", "agent-test-*")
@@ -1117,6 +1171,39 @@ func (m *mockCustomTool) Parameters() map[string]any {
 
 func (m *mockCustomTool) Execute(ctx context.Context, args map[string]any) *tools.ToolResult {
 	return tools.SilentResult("Custom tool executed")
+}
+
+// mockToolWithName is a mock tool with a configurable tool name.
+type mockToolWithName struct {
+	name string
+}
+
+// Name returns the configured tool name.
+// It accepts no parameters and returns the deterministic registration identifier.
+func (m *mockToolWithName) Name() string {
+	return m.name
+}
+
+// Description returns a generic mock tool description.
+// It accepts no parameters and returns a static test string.
+func (m *mockToolWithName) Description() string {
+	return "Mock configurable tool for testing"
+}
+
+// Parameters returns an empty object schema.
+// It accepts no parameters and returns a minimal tool parameter definition.
+func (m *mockToolWithName) Parameters() map[string]any {
+	return map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	}
+}
+
+// Execute returns a static success result.
+// The ctx and args parameters are unused in this mock implementation.
+// It returns a non-error tool result.
+func (m *mockToolWithName) Execute(ctx context.Context, args map[string]any) *tools.ToolResult {
+	return tools.SilentResult("Named mock tool executed")
 }
 
 // mockContextualTool tracks context updates

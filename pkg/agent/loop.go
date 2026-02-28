@@ -116,26 +116,6 @@ func registerSharedTools(
 			continue
 		}
 
-		// Web tools
-		if searchTool := tools.NewWebSearchTool(tools.WebSearchToolOptions{
-			BraveAPIKey:          cfg.Tools.Web.Brave.APIKey,
-			BraveMaxResults:      cfg.Tools.Web.Brave.MaxResults,
-			BraveEnabled:         cfg.Tools.Web.Brave.Enabled,
-			TavilyAPIKey:         cfg.Tools.Web.Tavily.APIKey,
-			TavilyBaseURL:        cfg.Tools.Web.Tavily.BaseURL,
-			TavilyMaxResults:     cfg.Tools.Web.Tavily.MaxResults,
-			TavilyEnabled:        cfg.Tools.Web.Tavily.Enabled,
-			DuckDuckGoMaxResults: cfg.Tools.Web.DuckDuckGo.MaxResults,
-			DuckDuckGoEnabled:    cfg.Tools.Web.DuckDuckGo.Enabled,
-			PerplexityAPIKey:     cfg.Tools.Web.Perplexity.APIKey,
-			PerplexityMaxResults: cfg.Tools.Web.Perplexity.MaxResults,
-			PerplexityEnabled:    cfg.Tools.Web.Perplexity.Enabled,
-			Proxy:                cfg.Tools.Web.Proxy,
-		}); searchTool != nil {
-			agent.Tools.Register(searchTool)
-		}
-		agent.Tools.Register(tools.NewWebFetchToolWithProxy(50000, cfg.Tools.Web.Proxy))
-
 		// Hardware tools (I2C, SPI) - Linux only, returns error on other platforms
 		agent.Tools.Register(tools.NewI2CTool())
 		agent.Tools.Register(tools.NewSPITool())
@@ -253,28 +233,36 @@ func applyRemoteMCPToolsToRegistry(
 	}
 
 	newInjected := make(map[string]struct{}, len(desired))
-	for proxyName, item := range desired {
+	orderedProxyNames := sortedDesiredProxyNames(desired)
+	for _, proxyName := range orderedProxyNames {
+		item := desired[proxyName]
+		targetProxyName := proxyName
+
 		if _, wasInjected := previous[proxyName]; !wasInjected {
 			if existing, exists := registry.Get(proxyName); exists {
 				if _, isRemoteProxy := existing.(*tools.RemoteMCPProxyTool); !isRemoteProxy {
-					logger.DebugCF("agent", "Skip remote MCP tool due to name collision", map[string]any{
-						"agent_id":   agentID,
-						"tool_name":  proxyName,
-						"server_name": item.ServerName,
+					aliasBase := sanitizeDynamicToolName(item.ServerName) + "__" + proxyName
+					targetProxyName = resolveRemoteCollisionAlias(registry, aliasBase, newInjected)
+					logger.DebugCF("agent", "Remote MCP tool name collision detected; registering alias", map[string]any{
+						"agent_id":        agentID,
+						"tool_name":       proxyName,
+						"alias_name":      targetProxyName,
+						"server_name":     item.ServerName,
+						"collides_with":   fmt.Sprintf("%T", existing),
+						"remote_tool_name": item.Name,
 					})
-					continue
 				}
 			}
 		}
 
 		logger.DebugCF("agent", "Injecting remote MCP proxy tool", map[string]any{
-			"agent_id":   agentID,
-			"proxy_name": proxyName,
+			"agent_id":    agentID,
+			"proxy_name":  targetProxyName,
 			"server_name": item.ServerName,
 			"remote_tool": item.Name,
 		})
-		registry.Register(tools.NewRemoteMCPProxyTool(proxyName, item, remoteClient))
-		newInjected[proxyName] = struct{}{}
+		registry.Register(tools.NewRemoteMCPProxyTool(targetProxyName, item, remoteClient))
+		newInjected[targetProxyName] = struct{}{}
 	}
 
 	for previousName := range previous {
@@ -291,6 +279,70 @@ func applyRemoteMCPToolsToRegistry(
 		"discovered":    len(discovered),
 		"injected_count": len(newInjected),
 	})
+}
+
+// sortedDesiredProxyNames returns deterministic proxy-name order for remote MCP injection.
+// The desired parameter maps proxy names to discovered metadata.
+// It returns ascending sorted proxy names.
+func sortedDesiredProxyNames(desired map[string]tools.RemoteMCPDiscoveredTool) []string {
+	if len(desired) == 0 {
+		return nil
+	}
+
+	ordered := make([]string, 0, len(desired))
+	for proxyName := range desired {
+		ordered = append(ordered, proxyName)
+	}
+	sort.Strings(ordered)
+
+	return ordered
+}
+
+// resolveRemoteCollisionAlias finds an available proxy name when a remote tool collides with a local one.
+// The registry parameter provides existing tool names, aliasBase is preferred alias prefix,
+// and newlyInjected tracks aliases reserved during current refresh.
+// It returns a stable alias name that does not overwrite non-remote local tools.
+func resolveRemoteCollisionAlias(
+	registry *tools.ToolRegistry,
+	aliasBase string,
+	newlyInjected map[string]struct{},
+) string {
+	base := strings.TrimSpace(aliasBase)
+	if base == "" {
+		base = "remote__tool"
+	}
+
+	if isRemoteProxyNameAvailable(registry, base, newlyInjected) {
+		return base
+	}
+
+	for idx := 2; ; idx++ {
+		candidate := fmt.Sprintf("%s__%d", base, idx)
+		if isRemoteProxyNameAvailable(registry, candidate, newlyInjected) {
+			return candidate
+		}
+	}
+}
+
+// isRemoteProxyNameAvailable reports whether a proxy name can be used for remote MCP injection.
+// The registry parameter is queried for existing tools and newlyInjected tracks names already reserved.
+// It returns true when name is free or currently occupied by another remote proxy.
+func isRemoteProxyNameAvailable(
+	registry *tools.ToolRegistry,
+	name string,
+	newlyInjected map[string]struct{},
+) bool {
+	if _, exists := newlyInjected[name]; exists {
+		return false
+	}
+
+	existing, exists := registry.Get(name)
+	if !exists {
+		return true
+	}
+
+	_, isRemoteProxy := existing.(*tools.RemoteMCPProxyTool)
+	return isRemoteProxy
 }
 
 // buildDesiredRemoteProxyNames computes stable proxy names for discovered tools.
