@@ -35,10 +35,7 @@ func TestBuildConfiguredRemoteMCPServers(t *testing.T) {
 		},
 		"alpha": {
 			Type: "http",
-			URL:  "https://alpha.example.com/mcp",
-			Headers: map[string]string{
-				"Authorization": "Bearer token",
-			},
+			URL:  "https://alpha.example.com/mcp?APIKEY=token",
 		},
 	})
 

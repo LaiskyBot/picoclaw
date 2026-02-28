@@ -16,6 +16,7 @@ import (
 
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/logger"
+	"github.com/sipeed/picoclaw/pkg/utils"
 )
 
 const (
@@ -161,9 +162,21 @@ func newMCPMemoryClientFromRemote(remote map[string]config.RemoteMCPServerConfig
 		headers[headerKey] = strings.TrimSpace(value)
 	}
 
+	normalizedAuth := utils.NormalizeMCPRemoteEndpointAuth(strings.TrimSpace(entry.URL), headers)
+	endpoint := normalizedAuth.Endpoint
+	headers = normalizedAuth.Headers
+	if normalizedAuth.StrippedSensitiveQuery || normalizedAuth.MovedQueryCredentials {
+		logger.DebugCF("agent", "Normalized MCP memory remote authentication", map[string]any{
+			"remote_name":              name,
+			"moved_query_credentials":  normalizedAuth.MovedQueryCredentials,
+			"stripped_sensitive_query": normalizedAuth.StrippedSensitiveQuery,
+			"has_authorization":        hasAuthorizationHeader(headers),
+		})
+	}
+
 	logger.DebugCF("agent", "Initialized MCP memory client from remote config", map[string]any{
 		"remote_name":        name,
-		"endpoint":           strings.TrimSpace(entry.URL),
+		"endpoint":           endpoint,
 		"header_count":       len(headers),
 		"has_authorization":  hasAuthorizationHeader(headers),
 		"memory_project":     memoryMCPProjectID,
@@ -172,7 +185,7 @@ func newMCPMemoryClientFromRemote(remote map[string]config.RemoteMCPServerConfig
 	})
 
 	return &mcpTurnMemoryClient{
-		endpoint: strings.TrimSpace(entry.URL),
+		endpoint: endpoint,
 		headers:  headers,
 		client: &http.Client{
 			Timeout: memoryMCPRequestTimeout,
@@ -361,6 +374,18 @@ func (c *mcpTurnMemoryClient) callJSONRPC(ctx context.Context, sessionID, method
 // callJSONRPCWithSession sends JSON-RPC to remote endpoint and captures returned session header.
 // The sessionID, method, and params define request details and returns result plus next session ID.
 func (c *mcpTurnMemoryClient) callJSONRPCWithSession(ctx context.Context, sessionID, method string, params any) (any, string, error) {
+	normalizedAuth := utils.NormalizeMCPRemoteEndpointAuth(c.endpoint, c.headers)
+	endpoint := normalizedAuth.Endpoint
+	headers := normalizedAuth.Headers
+	if normalizedAuth.StrippedSensitiveQuery || normalizedAuth.MovedQueryCredentials {
+		logger.DebugCF("agent", "Normalized MCP memory request authentication", map[string]any{
+			"method":                   method,
+			"moved_query_credentials":  normalizedAuth.MovedQueryCredentials,
+			"stripped_sensitive_query": normalizedAuth.StrippedSensitiveQuery,
+			"has_authorization":        hasAuthorizationHeader(headers),
+		})
+	}
+
 	requestID := fmt.Sprintf("mcp-memory-%d", memoryTurnCounter.Add(1))
 	body, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
@@ -372,7 +397,7 @@ func (c *mcpTurnMemoryClient) callJSONRPCWithSession(ctx context.Context, sessio
 		return nil, "", fmt.Errorf("marshal json-rpc request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, "", fmt.Errorf("build json-rpc request: %w", err)
 	}
@@ -382,7 +407,7 @@ func (c *mcpTurnMemoryClient) callJSONRPCWithSession(ctx context.Context, sessio
 	if sessionID != "" {
 		req.Header.Set("Mcp-Session-Id", sessionID)
 	}
-	for key, value := range c.headers {
+	for key, value := range headers {
 		headerKey := strings.TrimSpace(key)
 		if headerKey == "" {
 			continue
@@ -392,11 +417,11 @@ func (c *mcpTurnMemoryClient) callJSONRPCWithSession(ctx context.Context, sessio
 
 	logger.DebugCF("agent", "Sending MCP memory JSON-RPC request", map[string]any{
 		"method":             method,
-		"endpoint":           c.endpoint,
+		"endpoint":           endpoint,
 		"request_id":         requestID,
 		"has_session_id":     strings.TrimSpace(sessionID) != "",
-		"header_count":       len(c.headers),
-		"has_authorization":  hasAuthorizationHeader(c.headers),
+		"header_count":       len(headers),
+		"has_authorization":  hasAuthorizationHeader(headers),
 		"memory_before_tool": memoryBeforeToolName,
 		"memory_after_tool":  memoryAfterToolName,
 	})
@@ -415,9 +440,9 @@ func (c *mcpTurnMemoryClient) callJSONRPCWithSession(ctx context.Context, sessio
 		}
 		logger.DebugCF("agent", "MCP memory HTTP error response", map[string]any{
 			"method":            method,
-			"endpoint":          c.endpoint,
+			"endpoint":          endpoint,
 			"status_code":       resp.StatusCode,
-			"has_authorization": hasAuthorizationHeader(c.headers),
+			"has_authorization": hasAuthorizationHeader(headers),
 			"response_preview":  bodyPreview,
 		})
 		return nil, "", fmt.Errorf("mcp http status %d: %s", resp.StatusCode, bodyPreview)
@@ -430,10 +455,10 @@ func (c *mcpTurnMemoryClient) callJSONRPCWithSession(ctx context.Context, sessio
 	if envelope.Error != nil {
 		logger.DebugCF("agent", "MCP memory JSON-RPC error response", map[string]any{
 			"method":            method,
-			"endpoint":          c.endpoint,
+			"endpoint":          endpoint,
 			"rpc_code":          envelope.Error.Code,
 			"rpc_message":       envelope.Error.Message,
-			"has_authorization": hasAuthorizationHeader(c.headers),
+			"has_authorization": hasAuthorizationHeader(headers),
 		})
 		return nil, "", fmt.Errorf("mcp rpc error %d: %s", envelope.Error.Code, envelope.Error.Message)
 	}

@@ -96,6 +96,27 @@ func TestRemoteMCPToolRegistryLifecycle(t *testing.T) {
 	require.Contains(t, afterRemove.ForUser, "No remote MCP servers")
 }
 
+// TestRemoteMCPToolRegistryLifecycleNormalizesAPIKeyQuery verifies add_server migrates APIKEY query auth to headers.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestRemoteMCPToolRegistryLifecycleNormalizesAPIKeyQuery(t *testing.T) {
+	workspace := t.TempDir()
+	tool := NewRemoteMCPTool(workspace)
+
+	addResult := tool.Execute(context.Background(), map[string]any{
+		"operation": "add_server",
+		"name":      "demo",
+		"url":       "https://example.com/mcp?APIKEY=query-token",
+	})
+	require.False(t, addResult.IsError)
+
+	registry, err := tool.loadRegistry()
+	require.NoError(t, err)
+	require.Len(t, registry.Servers, 1)
+	require.Equal(t, "https://example.com/mcp", registry.Servers[0].URL)
+	require.Equal(t, "Bearer query-token", registry.Servers[0].Headers["Authorization"])
+}
+
 // TestRemoteMCPToolListAndCall verifies list_tools and call_tool against a mock MCP endpoint.
 // The t parameter controls test lifecycle.
 // It returns no value and fails the test on assertion errors.
@@ -175,6 +196,53 @@ func TestRemoteMCPToolListAndCall(t *testing.T) {
 	})
 	require.False(t, callResult.IsError)
 	require.Contains(t, callResult.ForUser, "ok")
+}
+
+// TestRemoteMCPToolListAndCallNormalizesAPIKeyQuery verifies URL query credentials are stripped and sent via Authorization.
+// The t parameter controls test lifecycle.
+// It returns no value and fails the test on assertion errors.
+func TestRemoteMCPToolListAndCallNormalizesAPIKeyQuery(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		require.Equal(t, "", r.URL.RawQuery)
+		require.Equal(t, "Bearer query-token", r.Header.Get("Authorization"))
+
+		var req map[string]any
+		err := json.NewDecoder(r.Body).Decode(&req)
+		require.NoError(t, err)
+
+		method, _ := req["method"].(string)
+		switch method {
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", "session-query-auth")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req["id"],
+				"result":  map[string]any{"protocolVersion": "2024-11-05"},
+			})
+		case "tools/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req["id"],
+				"result": map[string]any{
+					"tools": []map[string]any{{"name": "echo"}},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	tool := NewRemoteMCPTool(t.TempDir())
+	listToolsResult := tool.Execute(context.Background(), map[string]any{
+		"operation": "list_tools",
+		"url":       server.URL + "?APIKEY=query-token",
+		"name":      "query-auth-server",
+	})
+	require.False(t, listToolsResult.IsError)
+	require.Contains(t, listToolsResult.ForUser, "echo")
 }
 
 // TestRemoteMCPToolDiscoverConfiguredTools verifies discovery output from configured servers.

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/sipeed/picoclaw/pkg/logger"
+	"github.com/sipeed/picoclaw/pkg/utils"
 )
 
 const (
@@ -244,6 +245,17 @@ func (t *RemoteMCPTool) executeAddServer(args map[string]any) *ToolResult {
 	}
 
 	headers := normalizeHeaders(args["headers"])
+	normalizedAuth := utils.NormalizeMCPRemoteEndpointAuth(parsedURL, headers)
+	parsedURL = normalizedAuth.Endpoint
+	headers = normalizedAuth.Headers
+	if normalizedAuth.StrippedSensitiveQuery || normalizedAuth.MovedQueryCredentials {
+		logger.DebugCF("tool", "Normalized remote MCP add_server authentication", map[string]any{
+			"server_name":              name,
+			"moved_query_credentials":  normalizedAuth.MovedQueryCredentials,
+			"stripped_sensitive_query": normalizedAuth.StrippedSensitiveQuery,
+			"has_authorization":        hasAuthorizationHeader(headers),
+		})
+	}
 
 	registry, err := t.loadRegistry()
 	if err != nil {
@@ -405,10 +417,21 @@ func (t *RemoteMCPTool) resolveServer(args map[string]any) (remoteMCPServer, err
 		if name == "" {
 			name = "adhoc"
 		}
+
+		normalizedAuth := utils.NormalizeMCPRemoteEndpointAuth(resolvedURL, normalizeHeaders(args["headers"]))
+		if normalizedAuth.StrippedSensitiveQuery || normalizedAuth.MovedQueryCredentials {
+			logger.DebugCF("tool", "Normalized remote MCP ad-hoc authentication", map[string]any{
+				"server_name":              name,
+				"moved_query_credentials":  normalizedAuth.MovedQueryCredentials,
+				"stripped_sensitive_query": normalizedAuth.StrippedSensitiveQuery,
+				"has_authorization":        hasAuthorizationHeader(normalizedAuth.Headers),
+			})
+		}
+
 		return remoteMCPServer{
 			Name:    name,
-			URL:     resolvedURL,
-			Headers: normalizeHeaders(args["headers"]),
+			URL:     normalizedAuth.Endpoint,
+			Headers: normalizedAuth.Headers,
 		}, nil
 	}
 
@@ -480,6 +503,18 @@ func (t *RemoteMCPTool) callJSONRPCWithSession(
 	method string,
 	params any,
 ) (any, string, error) {
+	normalizedAuth := utils.NormalizeMCPRemoteEndpointAuth(endpoint, headers)
+	endpoint = normalizedAuth.Endpoint
+	headers = normalizedAuth.Headers
+	if normalizedAuth.StrippedSensitiveQuery || normalizedAuth.MovedQueryCredentials {
+		logger.DebugCF("tool", "Normalized remote MCP request authentication", map[string]any{
+			"method":                   method,
+			"moved_query_credentials":  normalizedAuth.MovedQueryCredentials,
+			"stripped_sensitive_query": normalizedAuth.StrippedSensitiveQuery,
+			"has_authorization":        hasAuthorizationHeader(headers),
+		})
+	}
+
 	requestID := fmt.Sprintf("%d", remoteMCPRequestID.Add(1))
 	payload := remoteMCPRequest{
 		JSONRPC: "2.0",
@@ -626,6 +661,17 @@ func (t *RemoteMCPTool) BootstrapConfiguredServers(servers []ConfiguredRemoteMCP
 		}
 
 		normalizedHeaders := normalizeStringHeaders(candidate.Headers)
+		normalizedAuth := utils.NormalizeMCPRemoteEndpointAuth(resolvedURL, normalizedHeaders)
+		resolvedURL = normalizedAuth.Endpoint
+		normalizedHeaders = normalizedAuth.Headers
+		if normalizedAuth.StrippedSensitiveQuery || normalizedAuth.MovedQueryCredentials {
+			logger.DebugCF("tool", "Normalized configured remote MCP authentication", map[string]any{
+				"server_name":              name,
+				"moved_query_credentials":  normalizedAuth.MovedQueryCredentials,
+				"stripped_sensitive_query": normalizedAuth.StrippedSensitiveQuery,
+				"has_authorization":        hasAuthorizationHeader(normalizedHeaders),
+			})
+		}
 
 		updated := false
 		for i := range registry.Servers {
@@ -714,6 +760,18 @@ func normalizeStringHeaders(headers map[string]string) map[string]string {
 		out[headerName] = strings.TrimSpace(value)
 	}
 	return out
+}
+
+// hasAuthorizationHeader checks whether headers include a non-empty Authorization value.
+// The headers parameter is an HTTP header map and return value is true when auth is configured.
+func hasAuthorizationHeader(headers map[string]string) bool {
+	for key, value := range headers {
+		if strings.EqualFold(strings.TrimSpace(key), "authorization") && strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+
+	return false
 }
 
 // stringMapEqual compares two string maps for exact key/value equality.

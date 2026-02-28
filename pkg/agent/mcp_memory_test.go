@@ -98,6 +98,41 @@ func TestMCPMemoryClientCallJSONRPCWithSessionSendsAuthorization(t *testing.T) {
 	require.NotNil(t, result)
 }
 
+// TestMCPMemoryClientCallJSONRPCWithSessionNormalizesAPIKeyQuery verifies APIKEY query auth is moved to Authorization.
+// The t parameter controls test lifecycle and the function returns no value.
+func TestMCPMemoryClientCallJSONRPCWithSessionNormalizesAPIKeyQuery(t *testing.T) {
+	const expectedAuthorization = "Bearer query-token"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		require.Equal(t, "", r.URL.RawQuery)
+		require.Equal(t, expectedAuthorization, r.Header.Get("Authorization"))
+
+		var req map[string]any
+		err := json.NewDecoder(r.Body).Decode(&req)
+		require.NoError(t, err)
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      req["id"],
+			"result":  map[string]any{"ok": true},
+		})
+	}))
+	defer server.Close()
+
+	client := &mcpTurnMemoryClient{
+		endpoint: server.URL + "?APIKEY=query-token",
+		headers:  map[string]string{},
+		client:   server.Client(),
+	}
+
+	result, _, err := client.callJSONRPCWithSession(context.Background(), "", "initialize", map[string]any{})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+}
+
 // TestHasAuthorizationHeader verifies case-insensitive Authorization detection with non-empty values.
 // The t parameter controls test lifecycle and the function returns no value.
 func TestHasAuthorizationHeader(t *testing.T) {

@@ -372,11 +372,19 @@ func buildConfiguredRemoteMCPServers(remote map[string]config.RemoteMCPServerCon
 	servers := make([]tools.ConfiguredRemoteMCPServer, 0, len(names))
 	for _, name := range names {
 		entry := remote[name]
+		normalizedAuth := utils.NormalizeMCPRemoteEndpointAuth(entry.URL, entry.Headers)
+		if normalizedAuth.StrippedSensitiveQuery || normalizedAuth.MovedQueryCredentials {
+			logger.DebugCF("agent", "Normalized configured remote MCP authentication", map[string]any{
+				"server_name":              name,
+				"moved_query_credentials":  normalizedAuth.MovedQueryCredentials,
+				"stripped_sensitive_query": normalizedAuth.StrippedSensitiveQuery,
+			})
+		}
 		servers = append(servers, tools.ConfiguredRemoteMCPServer{
 			Name:    name,
 			Type:    entry.Type,
-			URL:     entry.URL,
-			Headers: entry.Headers,
+			URL:     normalizedAuth.Endpoint,
+			Headers: normalizedAuth.Headers,
 		})
 	}
 
