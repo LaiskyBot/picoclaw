@@ -637,17 +637,6 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 			return response, nil
 		}
 
-		if matched, signal := MatchStatusQuery(msg.Content); matched {
-			logger.DebugCF("agent", "Detected task status query", map[string]any{
-				"channel":        msg.Channel,
-				"chat_id":        msg.ChatID,
-				"sender_id":      msg.SenderID,
-				"matched_signal": signal,
-				"content_chars":  len(msg.Content),
-			})
-			return al.taskPipeline.BuildStatusReply(msg.Channel, msg.ChatID, msg.SenderID), nil
-		}
-
 		summaryCtx, summaryCancel := context.WithTimeout(ctx, 12*time.Second)
 		taskSummary := al.generateTaskSummary(summaryCtx, msg.Content)
 		summaryCancel()
@@ -1925,6 +1914,20 @@ func (al *AgentLoop) handleCommand(ctx context.Context, msg bus.InboundMessage) 
 	args := parts[1:]
 
 	switch cmd {
+	case "/status", "/tasks":
+		if al.taskPipeline == nil {
+			return "Task pipeline is not initialized.", true
+		}
+		logger.DebugCF("agent", "Handling explicit task status command", map[string]any{
+			"channel":        msg.Channel,
+			"chat_id":        msg.ChatID,
+			"sender_id":      msg.SenderID,
+			"command":        cmd,
+			"content_chars":  len(msg.Content),
+			"content_preview": utils.Truncate(content, 120),
+		})
+		return al.taskPipeline.BuildStatusReply(msg.Channel, msg.ChatID, msg.SenderID), true
+
 	case "/show":
 		if len(args) < 1 {
 			return "Usage: /show [model|channel|agents]", true

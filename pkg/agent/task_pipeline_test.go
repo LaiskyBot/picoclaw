@@ -373,21 +373,39 @@ func TestMatchStatusQuery_UrlStatusPathDoesNotTrigger(t *testing.T) {
 	require.Empty(t, signal)
 }
 
-// TestMatchStatusQuery_RecognizesCommandsAndKeywords verifies explicit status commands and keywords are still recognized.
+// TestMatchStatusQuery_RecognizesExplicitCommands verifies explicit slash status commands are recognized.
 // The t parameter controls test lifecycle and assertions.
-// It returns no value and fails when expected status queries are not matched.
-func TestMatchStatusQuery_RecognizesCommandsAndKeywords(t *testing.T) {
+// It returns no value and fails when command-based status queries are not matched.
+func TestMatchStatusQuery_RecognizesExplicitCommands(t *testing.T) {
 	matched, signal := MatchStatusQuery("/status")
 	require.True(t, matched)
 	require.Equal(t, "/status", signal)
 
-	matched, signal = MatchStatusQuery("当前任务进度到哪了")
+	matched, signal = MatchStatusQuery("/tasks")
 	require.True(t, matched)
-	require.Equal(t, "进度", signal)
+	require.Equal(t, "/tasks", signal)
+}
+
+// TestMatchStatusQuery_GenericTaskPhraseDoesNotTrigger verifies generic task requests are not treated as status queries.
+// The t parameter controls test lifecycle and assertions.
+// It returns no value and fails when normal user prompts containing "任务" are misclassified.
+func TestMatchStatusQuery_GenericTaskPhraseDoesNotTrigger(t *testing.T) {
+	matched, signal := MatchStatusQuery("你应该给自己设立一个定时任务，每周五上午的时候，帮我查询活动并整理后发给我")
+	require.False(t, matched)
+	require.Empty(t, signal)
+}
+
+// TestMatchStatusQuery_NaturalLanguageStatusPhraseDoesNotTrigger verifies natural-language status requests are not statically intercepted.
+// The t parameter controls test lifecycle and assertions.
+// It returns no value and fails when non-command status-like prompts are matched by static routing.
+func TestMatchStatusQuery_NaturalLanguageStatusPhraseDoesNotTrigger(t *testing.T) {
+	matched, signal := MatchStatusQuery("当前任务进度到哪了")
+	require.False(t, matched)
+	require.Empty(t, signal)
 
 	matched, signal = MatchStatusQuery("what is the current task status?")
-	require.True(t, matched)
-	require.Equal(t, "status", signal)
+	require.False(t, matched)
+	require.Empty(t, signal)
 }
 
 // TestAgentLoop_ProcessMessage_StatusURLRequestIsDelegated verifies status-like URL requests are delegated instead of misrouted.
@@ -416,6 +434,39 @@ func TestAgentLoop_ProcessMessage_StatusURLRequestIsDelegated(t *testing.T) {
 		ChatID:   "chat-77",
 		SenderID: "u77",
 		Content:  "总结分析一下这篇文章 https://x.com/1914ad/status/2026757796390449382",
+	})
+	require.NoError(t, err)
+	require.Contains(t, response, "Task ")
+	require.Contains(t, response, "accepted")
+	require.NotContains(t, response, "Task status:")
+}
+
+// TestAgentLoop_ProcessMessage_GenericTaskPromptIsDelegated verifies normal natural-language task prompts are delegated.
+// The t parameter controls setup and assertions for delegated planner routing.
+// It returns no value and fails when prompts are intercepted by static status response logic.
+func TestAgentLoop_ProcessMessage_GenericTaskPromptIsDelegated(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-loop-generic-task-prompt-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), &simpleMockProvider{response: "unused"})
+
+	response, err := al.processMessage(context.Background(), bus.InboundMessage{
+		Channel:  "telegram",
+		ChatID:   "chat-88",
+		SenderID: "u88",
+		Content:  "你应该给自己设立一个定时任务，每周五上午的时候，帮我查询 https://ottawatourism.ca/en/event-calendar ，搜集周六日适合带 6 岁小男孩家庭的活动，整理后发给我",
 	})
 	require.NoError(t, err)
 	require.Contains(t, response, "Task ")

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,8 +34,6 @@ const (
 	TaskExecutionModeParallel = "parallel"
 	TaskExecutionModeWait     = "wait"
 )
-
-var statusQueryURLPattern = regexp.MustCompile(`https?://\S+`)
 
 // PipelineTask stores the end-to-end state of a delegated background task.
 // It includes user origin metadata, planner execution status, and worker updates.
@@ -1052,8 +1049,8 @@ func IsStatusQuery(text string) bool {
 }
 
 // MatchStatusQuery checks whether input is a task status query and returns matched signal.
-// The text parameter is raw user input that may include URLs or punctuation noise.
-// It returns whether status intent is detected and the matched keyword/pattern.
+// The text parameter is raw user input.
+// It returns true only for explicit command forms to avoid keyword-based intent routing.
 func MatchStatusQuery(text string) (bool, string) {
 	trimmed := strings.TrimSpace(strings.ToLower(text))
 	if trimmed == "" {
@@ -1067,59 +1064,5 @@ func MatchStatusQuery(text string) (bool, string) {
 		return true, "/tasks"
 	}
 
-	cleaned := strings.TrimSpace(statusQueryURLPattern.ReplaceAllString(trimmed, " "))
-	if cleaned == "" {
-		return false, ""
-	}
-
-	asciiWordKeywords := []string{"status", "progress", "task", "tasks", "update", "running", "finished"}
-	for _, keyword := range asciiWordKeywords {
-		if hasASCIIWord(cleaned, keyword) {
-			return true, keyword
-		}
-	}
-
-	cjkKeywords := []string{"状态", "进度", "任务", "完成了吗", "还在", "到哪了", "超时", "卡住"}
-	for _, keyword := range cjkKeywords {
-		if strings.Contains(cleaned, keyword) {
-			return true, keyword
-		}
-	}
-
 	return false, ""
-}
-
-// hasASCIIWord reports whether keyword appears as an ASCII word token.
-// The text parameter should be pre-normalized to lowercase and keyword must be non-empty lowercase ASCII.
-// It returns true only when keyword is delimited by non-alphanumeric characters or boundaries.
-func hasASCIIWord(text, keyword string) bool {
-	if text == "" || keyword == "" {
-		return false
-	}
-
-	start := 0
-	for {
-		idx := strings.Index(text[start:], keyword)
-		if idx < 0 {
-			return false
-		}
-		idx += start
-		leftOK := idx == 0 || !isASCIIAlnum(rune(text[idx-1]))
-		rightPos := idx + len(keyword)
-		rightOK := rightPos >= len(text) || !isASCIIAlnum(rune(text[rightPos]))
-		if leftOK && rightOK {
-			return true
-		}
-		start = idx + len(keyword)
-		if start >= len(text) {
-			return false
-		}
-	}
-}
-
-// isASCIIAlnum reports whether r is an ASCII letter or digit.
-// The r parameter is a single rune inspected as a token boundary marker.
-// It returns true for [0-9A-Za-z].
-func isASCIIAlnum(r rune) bool {
-	return (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
 }
