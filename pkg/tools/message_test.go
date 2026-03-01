@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/sipeed/picoclaw/pkg/bus"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMessageTool_Execute_Success(t *testing.T) {
@@ -43,8 +44,8 @@ func TestMessageTool_Execute_Success(t *testing.T) {
 	}
 
 	// - ForLLM contains send status description
-	if result.ForLLM != "Message sent to test-channel:test-chat-id" {
-		t.Errorf("Expected ForLLM 'Message sent to test-channel:test-chat-id', got '%s'", result.ForLLM)
+	if result.ForLLM != "Message queued for delivery to test-channel:test-chat-id" {
+		t.Errorf("Expected ForLLM 'Message queued for delivery to test-channel:test-chat-id', got '%s'", result.ForLLM)
 	}
 
 	// - ForUser is empty (user already received message directly)
@@ -88,8 +89,8 @@ func TestMessageTool_Execute_WithCustomChannel(t *testing.T) {
 	if !result.Silent {
 		t.Error("Expected Silent=true")
 	}
-	if result.ForLLM != "Message sent to custom-channel:custom-chat-id" {
-		t.Errorf("Expected ForLLM 'Message sent to custom-channel:custom-chat-id', got '%s'", result.ForLLM)
+	if result.ForLLM != "Message queued for delivery to custom-channel:custom-chat-id" {
+		t.Errorf("Expected ForLLM 'Message queued for delivery to custom-channel:custom-chat-id', got '%s'", result.ForLLM)
 	}
 }
 
@@ -361,6 +362,81 @@ func TestMessageTool_Execute_RemapPipelineTaskIDToContextTarget(t *testing.T) {
 	if len(sent.Attachments) != 1 {
 		t.Fatalf("expected 1 attachment, got %d", len(sent.Attachments))
 	}
+}
+
+func TestMessageTool_Execute_RemapTelegramUserAliasToContextTarget(t *testing.T) {
+	tool := NewMessageTool()
+	tool.SetContext("telegram", "861999008")
+
+	var sent bus.OutboundMessage
+	tool.SetSendCallback(func(msg bus.OutboundMessage) error {
+		sent = msg
+		return nil
+	})
+
+	result := tool.Execute(context.Background(), map[string]any{
+		"content": "Please send the file",
+		"channel": "telegram",
+		"chat_id": "user",
+		"attachments": []any{
+			map[string]any{
+				"type": "document",
+				"path": "/tmp/guide.txt",
+			},
+		},
+	})
+
+	require.False(t, result.IsError)
+	require.Equal(t, "telegram", sent.Channel)
+	require.Equal(t, "861999008", sent.ChatID)
+	require.Len(t, sent.Attachments, 1)
+}
+
+func TestMessageTool_Execute_RejectTelegramUserAliasWithoutSafeFallback(t *testing.T) {
+	tool := NewMessageTool()
+	tool.SetContext("planner_task", "task-2026-02-26-0037")
+
+	called := false
+	tool.SetSendCallback(func(msg bus.OutboundMessage) error {
+		called = true
+		return nil
+	})
+
+	result := tool.Execute(context.Background(), map[string]any{
+		"content": "Send file",
+		"channel": "telegram",
+		"chat_id": "user",
+	})
+
+	require.True(t, result.IsError)
+	require.False(t, called)
+	require.Error(t, result.Err)
+	require.Contains(t, result.ForLLM, "placeholder chat alias")
+}
+
+func TestMessageTool_Execute_NormalizeCompositeAttachmentType(t *testing.T) {
+	tool := NewMessageTool()
+	tool.SetContext("telegram", "861999008")
+
+	var sent bus.OutboundMessage
+	tool.SetSendCallback(func(msg bus.OutboundMessage) error {
+		sent = msg
+		return nil
+	})
+
+	result := tool.Execute(context.Background(), map[string]any{
+		"content": "Send composite type file",
+		"attachments": []any{
+			map[string]any{
+				"type": "file/documented file",
+				"path": "/tmp/guide.txt",
+			},
+		},
+	})
+
+	require.False(t, result.IsError)
+	require.Len(t, sent.Attachments, 1)
+	require.Equal(t, "document", sent.Attachments[0].Type)
 }
 
 func TestMessageTool_Execute_KeepExplicitExternalTarget(t *testing.T) {

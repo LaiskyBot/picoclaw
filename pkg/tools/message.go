@@ -178,7 +178,7 @@ func (t *MessageTool) Execute(ctx context.Context, args map[string]any) *ToolRes
 	t.sentInRound = true
 	// Silent: user already received the message directly
 	return &ToolResult{
-		ForLLM: fmt.Sprintf("Message sent to %s:%s", channel, chatID),
+		ForLLM: fmt.Sprintf("Message queued for delivery to %s:%s", channel, chatID),
 		Silent: true,
 	}
 }
@@ -213,6 +213,14 @@ func (t *MessageTool) resolveTarget(requestedChannel, requestedChatID string) (s
 
 	fallbackChannel := strings.TrimSpace(t.defaultChannel)
 	fallbackChatID := strings.TrimSpace(t.defaultChatID)
+	if strings.EqualFold(strings.TrimSpace(channel), "telegram") && isCurrentContextChatAlias(strings.TrimSpace(chatID)) {
+		logger.DebugCF("tool", "Message tool remapped placeholder telegram chat_id to contextual chat", map[string]any{
+			"requested_channel": requestedChannel,
+			"requested_chat_id": requestedChatID,
+			"fallback_channel":  fallbackChannel,
+			"fallback_chat_id":  fallbackChatID,
+		})
+	}
 	logger.DebugCF("tool", "Message tool remapped pipeline/internal target to contextual chat", map[string]any{
 		"requested_channel": requestedChannel,
 		"requested_chat_id": requestedChatID,
@@ -232,6 +240,13 @@ func (t *MessageTool) shouldRemapToDefaultTarget(channel, chatID, requestedChann
 	defaultChatID := strings.TrimSpace(t.defaultChatID)
 	if defaultChannel == "" || defaultChatID == "" {
 		return false
+	}
+
+	if strings.EqualFold(strings.TrimSpace(channel), "telegram") &&
+		isCurrentContextChatAlias(strings.TrimSpace(chatID)) &&
+		strings.EqualFold(defaultChannel, "telegram") &&
+		!isCurrentContextChatAlias(defaultChatID) {
+		return true
 	}
 
 	if constants.IsInternalChannel(strings.TrimSpace(channel)) && !constants.IsInternalChannel(defaultChannel) {
@@ -270,6 +285,9 @@ func validateMessageTarget(channel, chatID string) error {
 	if constants.IsInternalChannel(resolvedChannel) {
 		return nil
 	}
+	if strings.EqualFold(resolvedChannel, "telegram") && isCurrentContextChatAlias(resolvedChatID) {
+		return fmt.Errorf("invalid chat_id for telegram: placeholder chat alias is not routable; omit chat_id to use current chat context")
+	}
 	if strings.EqualFold(resolvedChannel, "telegram") && looksLikePipelineTaskID(resolvedChatID) {
 		return fmt.Errorf("invalid chat_id for telegram: pipeline task ID is not routable; omit chat_id to use current chat context")
 	}
@@ -281,6 +299,70 @@ func validateMessageTarget(channel, chatID string) error {
 // It accepts a chat ID string and returns true when it matches task-YYYY-MM-DD-NNNN.
 func looksLikePipelineTaskID(chatID string) bool {
 	return pipelineTaskIDPattern.MatchString(strings.TrimSpace(chatID))
+}
+
+// isCurrentContextChatAlias reports whether chat ID is a placeholder for current conversation target.
+// The chatID parameter is a potentially model-generated value and return value indicates alias detection.
+func isCurrentContextChatAlias(chatID string) bool {
+	switch strings.ToLower(strings.TrimSpace(chatID)) {
+	case "user", "current", "current_user", "self", "me", "default":
+		return true
+	default:
+		return false
+	}
+}
+
+// normalizeAttachmentType normalizes model-generated attachment type variants into supported values.
+// The raw parameter is the original type text and return values are normalized type and success flag.
+func normalizeAttachmentType(raw string) (string, bool) {
+	typeText := strings.ToLower(strings.TrimSpace(raw))
+	if typeText == "" {
+		return "", false
+	}
+
+	normalizeToken := func(token string) (string, bool) {
+		t := strings.TrimSpace(token)
+		if t == "" {
+			return "", false
+		}
+		switch t {
+		case "image", "photo", "picture", "pic":
+			return "photo", true
+		case "document", "doc", "file":
+			return "document", true
+		}
+
+		if strings.Contains(t, "image") || strings.Contains(t, "photo") || strings.Contains(t, "picture") {
+			return "photo", true
+		}
+		if strings.Contains(t, "document") || strings.Contains(t, "file") || strings.Contains(t, "attachment") {
+			return "document", true
+		}
+
+		return "", false
+	}
+
+	for _, token := range []string{typeText} {
+		if normalized, ok := normalizeToken(token); ok {
+			return normalized, true
+		}
+	}
+
+	segments := strings.FieldsFunc(typeText, func(r rune) bool {
+		switch r {
+		case '/', '|', ',', ';':
+			return true
+		default:
+			return false
+		}
+	})
+	for _, token := range segments {
+		if normalized, ok := normalizeToken(token); ok {
+			return normalized, true
+		}
+	}
+
+	return "", false
 }
 
 // parseMessageAttachments converts tool argument attachments into typed outbound attachments.
@@ -303,21 +385,23 @@ func parseMessageAttachments(raw any) ([]bus.OutboundAttachment, error) {
 		}
 
 		attachmentType, _ := obj["type"].(string)
-		attachmentType = strings.ToLower(strings.TrimSpace(attachmentType))
-		if attachmentType == "" {
+		if strings.TrimSpace(attachmentType) == "" {
 			return nil, fmt.Errorf("attachments[%d].type is required", i)
 		}
-
-		switch attachmentType {
-		case "image":
-			attachmentType = "photo"
-		case "photo", "document", "file":
-		default:
+		normalizedType, ok := normalizeAttachmentType(attachmentType)
+		if !ok {
 			return nil, fmt.Errorf("attachments[%d].type must be one of photo/image/document/file", i)
+		}
+		if strings.ToLower(strings.TrimSpace(attachmentType)) != normalizedType {
+			logger.DebugCF("tool", "Message tool normalized attachment type", map[string]any{
+				"index":           i,
+				"raw_type":        attachmentType,
+				"normalized_type": normalizedType,
+			})
 		}
 
 		attachment := bus.OutboundAttachment{
-			Type:    attachmentType,
+			Type:    normalizedType,
 			URL:     strings.TrimSpace(stringArg(obj, "url")),
 			FileID:  strings.TrimSpace(stringArg(obj, "file_id")),
 			Path:    strings.TrimSpace(stringArg(obj, "path")),
